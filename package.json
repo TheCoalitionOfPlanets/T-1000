@@ -1,0 +1,16 @@
+{
+  "name": "t1000",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "apps/web"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace @t1000/web --",
+    "build": "npm run build --workspace @t1000/web --",
+    "test:web": "npm run test --workspace @t1000/web --"
+  },
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  }
+}

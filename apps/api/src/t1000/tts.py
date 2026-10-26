@@ -2,11 +2,11 @@
 
 import os
 import logging
+import hashlib
 import queue
 import threading
 import time
 from functools import lru_cache
-from pathlib import Path
 from uuid import uuid4
 
 os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
@@ -18,12 +18,16 @@ import numpy as np
 import soundfile as sf
 import torch
 
-ROOT = Path(__file__).resolve().parent
-MODEL_PATH = ROOT / "models" / "dots.tts-soar"
-OUTPUT_DIR = ROOT / "outputs"
-EXAMPLE_AUDIO = ROOT / "examples" / "reference-en.wav"
+from . import stt
+from .mic import consume_complete
+from .paths import ASSETS, CACHE, MODELS, OUTPUT
+
+MODEL_PATH = MODELS / "dots.tts-soar"
+OUTPUT_DIR = OUTPUT
+EXAMPLE_AUDIO = ASSETS / "ref.wav"
 EXAMPLE_TRANSCRIPT = "We asked over twenty different people, and they all said it was his."
 DEVICE = "CUDA GPU" if torch.cuda.is_available() else "CPU"
+REFERENCE_LIMIT = 10 if DEVICE == "CPU" else 30
 GENERATION_TIMEOUT = 600
 MODEL_LOCK = threading.Lock()
 ACTIVE_LOCK = threading.Lock()
@@ -53,6 +57,9 @@ def load_runtime():
 
 def read_reference(path):
     """Reject unusable recordings before starting expensive inference."""
+    info = sf.info(path)
+    if info.duration > REFERENCE_LIMIT:
+        raise ValueError(f"Use a reference recording of {REFERENCE_LIMIT} seconds or less.")
     audio, sample_rate = sf.read(path, dtype="float32", always_2d=True)
     if not audio.size or not np.isfinite(audio).all():
         raise ValueError("The reference recording is empty or contains invalid audio.")
@@ -60,8 +67,6 @@ def read_reference(path):
     duration = audio.size / sample_rate
     if duration < 1:
         raise ValueError("Record at least one second of speech; 3–10 seconds works best.")
-    if DEVICE == "CPU" and duration > 10:
-        raise ValueError("Use a reference recording of 10 seconds or less for this CPU demo.")
     peak = float(np.abs(audio).max())
     rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
     if peak < 0.0001 or rms < 0.00001:
@@ -70,6 +75,127 @@ def read_reference(path):
             "record a clear sentence, or click Use example voice."
         )
     return audio, sample_rate
+
+
+class ReferenceState:
+    """Invalidate late transcription results when the user replaces a reference."""
+
+    def __init__(self):
+        self.path = str(EXAMPLE_AUDIO) if EXAMPLE_AUDIO.exists() else None
+        self.ready = EXAMPLE_AUDIO.exists()
+        self.version = 0
+        self.recording_token = None
+        self.lock = threading.Lock()
+
+    def __deepcopy__(self, memo):
+        return ReferenceState()
+
+    def replace(self, path=None, ready=False, recording_token=None):
+        self.version += 1
+        self.path = path
+        self.ready = ready
+        self.recording_token = recording_token
+
+
+def prepare_upload(path, state):
+    with state.lock:
+        state.replace(path=path)
+    return "", "Transcribing the reference recording…", gr.update(interactive=False), uuid4().hex
+
+
+def transcribe_upload(path, state):
+    with state.lock:
+        version = state.version
+        if path != state.path:
+            return (gr.skip(),) * 3
+    valid = False
+    try:
+        read_reference(path)
+        valid = True
+        words = stt.transcribe_file(path, max_seconds=REFERENCE_LIMIT).strip()
+        message = (
+            "Recording transcribed. Check the words before generating speech."
+            if words else "No speech was recognized. Check the audio or enter its exact words below."
+        )
+    except Exception as exc:
+        LOGGER.warning("Reference transcription failed: %s", exc)
+        words = ""
+        message = f"Automatic transcription failed: {exc}"
+        if valid:
+            message += " You can enter the exact words below."
+    with state.lock:
+        if version != state.version or path != state.path:
+            return (gr.skip(),) * 3
+        state.ready = valid
+    return words, message, gr.update(interactive=valid)
+
+
+def begin_recording(state, evt: gr.EventData):
+    with state.lock:
+        state.replace(recording_token=evt._data.get("token"))
+    return "", "Recording… Your words appear beside the microphone controls.", gr.update(interactive=False)
+
+
+def finish_recording(state, evt: gr.EventData):
+    token = evt._data.get("token")
+    with state.lock:
+        if not token or token != state.recording_token:
+            return (gr.skip(),) * 5
+        if evt._data.get("error"):
+            state.replace()
+            return None, "", "Recording could not be saved. Try recording again or upload a clip.", gr.update(interactive=False), uuid4().hex
+        version = state.version
+    path, words, message = consume_complete(evt)
+    if not isinstance(path, str):
+        return (gr.skip(),) * 5
+    valid = True
+    try:
+        read_reference(path)
+    except (ValueError, RuntimeError, sf.LibsndfileError) as exc:
+        valid = False
+        words, message = "", str(exc)
+    with state.lock:
+        if version != state.version or token != state.recording_token:
+            return (gr.skip(),) * 5
+        state.replace(path=path, ready=valid)
+    return path, words, message, gr.update(interactive=valid), uuid4().hex
+
+
+def clear_reference(state):
+    with state.lock:
+        state.replace()
+    return "", "Record or upload a reference voice.", gr.update(interactive=False), uuid4().hex
+
+
+def restore_example(state):
+    with state.lock:
+        state.replace(path=str(EXAMPLE_AUDIO), ready=True)
+    return str(EXAMPLE_AUDIO), EXAMPLE_TRANSCRIPT, "Example voice ready.", gr.update(interactive=True), uuid4().hex
+
+
+def synthesize_ready(text, reference_audio, transcript, steps, seed, state):
+    with state.lock:
+        path, version = state.path, state.version
+        if not state.ready or not path or not reference_audio:
+            raise gr.Error("Finish recording and wait for its transcript before generating speech.")
+    # Gradio serves copies of output audio from its cache. Validate their contents
+    # against the selected reference, then freeze that server-owned source.
+    if reference_audio != path:
+        try:
+            with open(reference_audio, "rb") as supplied, open(path, "rb") as selected:
+                matches = hashlib.file_digest(supplied, "sha256").digest() == hashlib.file_digest(selected, "sha256").digest()
+        except OSError:
+            matches = False
+        if not matches:
+            raise gr.Error("The reference changed. Wait for the new recording's transcript.")
+    with state.lock:
+        if version != state.version or not state.ready:
+            raise gr.Error("The reference changed. Wait for the new recording's transcript.")
+    for update in synthesize(text, path, transcript, steps, seed):
+        with state.lock:
+            if not state.ready:
+                update = (*update[:2], gr.update(interactive=False), update[3])
+        yield update
 
 
 def stop_generation():
@@ -98,7 +224,7 @@ def synthesize(text, reference_audio, transcript, steps, seed):
         raise gr.Error(str(exc)) from exc
 
     # Freeze the input so a new recording cannot change a running request.
-    request_dir = ROOT / ".cache" / "requests"
+    request_dir = CACHE / "requests"
     request_dir.mkdir(parents=True, exist_ok=True)
     reference_path = request_dir / f"reference-{uuid4().hex}.wav"
     sf.write(reference_path, reference, reference_rate, subtype="PCM_16")
@@ -111,9 +237,10 @@ def synthesize(text, reference_audio, transcript, steps, seed):
     def run():
         global ACTIVE_STOP
         try:
-            with MODEL_LOCK:
+            with MODEL_LOCK, stt.gpu_compute_lock():
                 if cancel.is_set():
                     return
+                stt.release_gpu_model()
                 from dots_tts.utils.util import seed_everything
 
                 runtime = load_runtime()
@@ -206,42 +333,3 @@ def synthesize(text, reference_audio, transcript, steps, seed):
     finally:
         # Also stop computation when the browser/client closes the generator.
         cancel.set()
-
-
-def build_app():
-    with gr.Blocks(title="T-1000 · English Voice Lab") as demo:
-        gr.Markdown("# English Voice Lab\nTest dots.tts SOAR locally. Enter a short sentence and press **Generate speech**.")
-        if DEVICE == "CPU":
-            gr.Markdown(f"Running on **CPU**. Synthesis can take several minutes. Start with one short sentence (up to 150 characters). Generation time limit: **{GENERATION_TIMEOUT / 60:g} minutes**.")
-        with gr.Row():
-            with gr.Column():
-                text = gr.Textbox(
-                    label="Text to speak",
-                    value="Hello, this is a voice test.",
-                    lines=4,
-                )
-                with gr.Accordion("Clone a voice", open=True):
-                    gr.Markdown("An example English voice is preloaded. For your voice, record a clear 3–10 second sentence and enter exactly what you said. Changing the recording clears the old transcript.")
-                    reference = gr.Audio(label="Reference voice", value=str(EXAMPLE_AUDIO) if EXAMPLE_AUDIO.exists() else None, sources=["upload", "microphone"], type="filepath")
-                    transcript = gr.Textbox(label="Exact words in the recording", value=EXAMPLE_TRANSCRIPT if EXAMPLE_AUDIO.exists() else "", lines=2)
-                    example = gr.Button("Use example voice")
-                with gr.Accordion("Generation settings", open=False):
-                    steps = gr.Slider(4, 32, value=10, step=1, label="Sampling steps", info="Higher values take longer. SOAR recommends 10–32.")
-                    seed = gr.Number(value=42, precision=0, label="Seed")
-                with gr.Row():
-                    generate = gr.Button("Generate speech", variant="primary")
-                    stop = gr.Button("Stop", variant="stop", interactive=False)
-            with gr.Column():
-                sample = OUTPUT_DIR / "test-english.wav"
-                output = gr.Audio(label="Generated speech", value=str(sample) if sample.exists() else None, type="filepath")
-                status = gr.Textbox(label="Result", value="Ready. Use the example voice or add your own recording and transcript.", interactive=False)
-        reference.input(lambda: "", outputs=[transcript], queue=False)
-        example.click(lambda: (str(EXAMPLE_AUDIO), EXAMPLE_TRANSCRIPT), outputs=[reference, transcript], queue=False)
-        generate.click(synthesize, [text, reference, transcript, steps, seed], [output, status, generate, stop], api_name="synthesize", concurrency_limit=1, show_progress="hidden")
-        stop.click(stop_generation, queue=False, api_name="stop")
-    return demo.queue(default_concurrency_limit=1, max_size=4)
-
-
-if __name__ == "__main__":
-    load_runtime()
-    build_app().launch(server_name="127.0.0.1", server_port=7860, share=False, show_error=True)

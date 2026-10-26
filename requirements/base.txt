@@ -1,6 +1,6 @@
---extra-index-url https://download.pytorch.org/whl/cpu
+# Shared runtime; choose cpu.txt or gpu.txt for the PyTorch build.
 -c constraints.txt
 
-torch==2.8.0+cpu
-torchaudio==2.8.0+cpu
 dots.tts @ git+https://github.com/studio-dots-ai/dots.tts.git@b65ca7149fb43b8fb8d52916aa12738deda7b188
+sherpa-onnx==2.0.1
+soxr==1.1.0

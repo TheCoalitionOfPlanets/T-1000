@@ -1,7 +1,0 @@
-# See AGENT_HANDOFF.md for CUDA installation and CPU-to-GPU replacement flags.
-# Keep separate from requirements.txt, which intentionally pins CPU-only wheels.
--c constraints.txt
-
-torch==2.8.0
-torchaudio==2.8.0
-dots.tts @ git+https://github.com/studio-dots-ai/dots.tts.git@b65ca7149fb43b8fb8d52916aa12738deda7b188

@@ -1,6 +1,12 @@
-/models/
+/data/
 /.cache/
 /.venv/
-/outputs/
 __pycache__/
 *.py[cod]
+node_modules/
+dist/
+test-results/
+playwright-report/
+*.tsbuildinfo
+*.egg-info/
+/apps/api/build/
