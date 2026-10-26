@@ -10,7 +10,7 @@ import numpy as np
 import soundfile as sf
 import torch
 
-import app
+from t1000 import tts
 
 
 class SlowRuntime:
@@ -28,9 +28,9 @@ class InferenceControlsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "microphone.wav"
             sf.write(path, np.zeros(44100 * 6, dtype=np.float32), 44100)
-            with patch.object(app, "load_runtime") as load:
+            with patch.object(tts, "load_runtime") as load:
                 with self.assertRaisesRegex(gr.Error, "silent"):
-                    list(app.synthesize("Hello.", str(path), "Example transcript.", 10, 42))
+                    list(tts.synthesize("Hello.", str(path), "Example transcript.", 10, 42))
                 load.assert_not_called()
 
     def test_nonfinite_reference_is_rejected(self):
@@ -38,39 +38,39 @@ class InferenceControlsTests(unittest.TestCase):
             path = Path(directory) / "invalid.wav"
             sf.write(path, np.full(24000, np.nan, dtype=np.float32), 24000, subtype="FLOAT")
             with self.assertRaisesRegex(ValueError, "invalid audio"):
-                app.read_reference(path)
+                tts.read_reference(path)
 
     def test_example_reference_is_usable(self):
-        audio, sample_rate = app.read_reference(app.EXAMPLE_AUDIO)
+        audio, sample_rate = tts.read_reference(tts.EXAMPLE_AUDIO)
         self.assertEqual(sample_rate, 24000)
         self.assertGreater(audio.size / sample_rate, 3)
         self.assertGreater(float(np.abs(audio).max()), 0.01)
 
     def test_stop_releases_the_worker_and_reenables_generation(self):
-        with patch.object(app, "load_runtime", return_value=SlowRuntime()):
-            generator = app.synthesize("Hello.", str(app.EXAMPLE_AUDIO), app.EXAMPLE_TRANSCRIPT, 10, 42)
+        with patch.object(tts, "load_runtime", return_value=SlowRuntime()):
+            generator = tts.synthesize("Hello.", str(tts.EXAMPLE_AUDIO), tts.EXAMPLE_TRANSCRIPT, 10, 42)
             next(generator)
-            app.stop_generation()
+            tts.stop_generation()
             updates = list(generator)
         self.assertIn("Stopped", updates[-1][1])
         self.assertTrue(updates[-1][2]["interactive"])
         self.assertFalse(updates[-1][3]["interactive"])
-        self.assertIsNone(app.ACTIVE_STOP)
-        self.assertFalse(app.MODEL_LOCK.locked())
+        self.assertIsNone(tts.ACTIVE_STOP)
+        self.assertFalse(tts.MODEL_LOCK.locked())
 
     def test_deadline_preserves_partial_audio_and_releases_worker(self):
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(app, "load_runtime", return_value=SlowRuntime()), \
-                    patch.object(app, "GENERATION_TIMEOUT", 0.15), \
-                    patch.object(app, "OUTPUT_DIR", Path(directory)):
+            with patch.object(tts, "load_runtime", return_value=SlowRuntime()), \
+                    patch.object(tts, "GENERATION_TIMEOUT", 0.15), \
+                    patch.object(tts, "OUTPUT_DIR", Path(directory)):
                 started = time.perf_counter()
-                updates = list(app.synthesize("Hello.", str(app.EXAMPLE_AUDIO), app.EXAMPLE_TRANSCRIPT, 10, 42))
+                updates = list(tts.synthesize("Hello.", str(tts.EXAMPLE_AUDIO), tts.EXAMPLE_TRANSCRIPT, 10, 42))
                 elapsed = time.perf_counter() - started
                 self.assertIn("time limit", updates[-1][1])
                 self.assertIn("partial audio", updates[-1][1])
                 self.assertTrue(Path(updates[-1][0]).is_file())
                 self.assertLess(elapsed, 3)
-                self.assertFalse(app.MODEL_LOCK.locked())
+                self.assertFalse(tts.MODEL_LOCK.locked())
 
 
 if __name__ == "__main__":

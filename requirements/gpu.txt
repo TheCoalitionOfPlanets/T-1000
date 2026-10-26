@@ -1,0 +1,5 @@
+# See docs/setup.md for CUDA installation and CPU-to-GPU replacement flags.
+-r base.txt
+
+torch==2.8.0
+torchaudio==2.8.0

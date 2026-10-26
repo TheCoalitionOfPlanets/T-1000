@@ -1,0 +1,6 @@
+# Optional CUDA recognition; install after gpu.txt.
+# Select STT_BACKEND=cuda at launch; recognition defaults to CPU.
+-c constraints.txt
+
+faster-whisper==1.2.1
+ctranslate2==4.8.4
