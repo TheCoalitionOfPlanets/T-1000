@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-10-26 — Project README
+
+- Adopted the supplied README format with setup, usage, configuration, privacy,
+  architecture, development, and troubleshooting sections.
+- Added a local logo and a screenshot of the running voice studio.
+- Documented the project's current status and third-party terms without
+  introducing unsupported release, CI, or project-license badges.
+
+Validation: local documentation links and anchors, shell example syntax,
+template placeholders, and whitespace checks pass.
+
 ## 2026-10-26 — Monorepo structure
 
 - Grouped the Python API and React app under `apps/api` and `apps/web`, with
