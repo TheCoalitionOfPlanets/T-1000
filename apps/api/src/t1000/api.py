@@ -31,7 +31,7 @@ FRONTEND_DIR = WEB
 MAX_UPLOAD_BYTES = 32 * 1024 * 1024
 MAX_REQUEST_BYTES = 40 * 1024 * 1024
 MAX_AUDIO_ENTRIES = 256
-TEXT_LIMIT = 150 if voice.DEVICE == "CPU" else 500
+TEXT_LIMIT = voice.TEXT_LIMIT
 recorder = RecorderService(voice.REFERENCE_LIMIT)
 generation_lock = threading.Lock()
 audio_lock = threading.Lock()
@@ -103,6 +103,11 @@ def _validate_reference(path):
 
 api = FastAPI(title="T-1000 Voice Lab", docs_url=None, redoc_url=None)
 app = api
+
+
+@api.get("/api/health")
+def health():
+    return {"status": "ok", "device": voice.DEVICE, "speech_model_loaded": bool(voice.load_runtime.cache_info().currsize)}
 
 
 @api.middleware("http")

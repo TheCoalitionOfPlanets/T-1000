@@ -20,7 +20,7 @@ def build_app():
                     lines=4,
                 )
                 with gr.Accordion("Clone a voice", open=True):
-                    gr.Markdown("Record a clear 3–10 second English sentence. Your words appear while you speak and fill the transcript when you finish. You can also upload a recording. Review the transcript before generating speech.")
+                    gr.Markdown(f"Record a clear 3–{min(10, voice.REFERENCE_LIMIT)} second English sentence. Your words appear while you speak and fill the transcript when you finish. You can also upload a recording. Review the transcript before generating speech.")
                     microphone = build_recorder(voice.REFERENCE_LIMIT)
                     reference = gr.Audio(label="Reference voice · upload or preview", value=str(voice.EXAMPLE_AUDIO) if voice.EXAMPLE_AUDIO.exists() else None, sources=["upload"], type="filepath", editable=False)
                     transcript = gr.Textbox(label="Words in the recording · filled automatically, editable", value=voice.EXAMPLE_TRANSCRIPT if voice.EXAMPLE_AUDIO.exists() else "", lines=2)

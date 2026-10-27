@@ -253,7 +253,7 @@ def build_recorder(max_seconds):
             <button type="button" class="record-start">Record my voice</button>
             <button type="button" class="record-stop" disabled>Finish recording</button>
           </div>
-          <p class="recorder-status" role="status" aria-live="polite">Record a clear 3–10 second English sentence. Words appear while you speak.</p>
+          <p class="recorder-status" role="status" aria-live="polite">Record a clear, short English sentence. Words appear while you speak.</p>
           <p class="recorder-preview" aria-live="polite"></p>
         </div>''',
         css_template='''.recorder-actions { display: flex; gap: 8px; }

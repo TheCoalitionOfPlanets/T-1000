@@ -49,9 +49,33 @@ T-1000 is a local voice studio for experimenting with English speech synthesis a
 | **System tools** | Git, FFmpeg, and libsndfile. |
 | **Browser** | A current browser with AudioWorklet; microphone access requires localhost or HTTPS. |
 | **Storage** | About 5.2 GB for SOAR and 662 MB for the CPU recognizer, plus dependencies and caches. |
-| **Optional GPU** | NVIDIA CUDA with a compatible PyTorch build and BF16 support. Minimum VRAM has not been verified; see [setup](docs/setup.md). |
+| **Optional GPU** | NVIDIA CUDA with a compatible PyTorch build; BF16 where supported, otherwise FP16. Minimum VRAM has not been verified; see [setup](docs/setup.md). |
 
 ## Installation
+
+### Docker
+
+Choose one setup; each builds the UI, downloads the pinned models into persistent
+volumes, loads inference, and starts the studio at **http://localhost:7860**.
+
+CPU:
+
+```bash
+docker compose -f compose.cpu.yaml up --build -d
+```
+
+NVIDIA GPU, with a compatible driver and NVIDIA Container Toolkit:
+
+```bash
+docker compose -f compose.gpu.yaml up --build -d
+```
+
+The first launch downloads about 5.2 GB of SOAR weights plus the CPU speech
+recognizer. See the [Docker guide](docs/docker.md) for logs, volume reuse,
+GPU requirements and low-memory profiles. Docker installations do not need
+Python or Node.js on the host.
+
+### Local installation
 
 Run these commands from a new checkout to install the default CPU profile:
 
@@ -113,7 +137,7 @@ The first generation also loads the speech model. CPU synthesis can take several
 
 ## Usage
 
-To use your own voice, click **Record voice**, speak a clear 3–10 second sentence, and click **Finish recording**. You can also choose **Upload audio**. Review the editable **Reference transcript** so its words match the recording exactly, then generate your new text. **Use example voice** restores the bundled reference and matching transcript.
+To use your own voice, click **Record voice**, speak a clear 3–6 second sentence, and click **Finish recording**. You can also choose **Upload audio**. Review the editable **Reference transcript** so its words match the recording exactly, then generate your new text. **Use example voice** restores the bundled reference and matching transcript.
 
 **Stop generation** requests cancellation after the current audio step. If audio has already been produced, it is saved as partial output. If automatic transcription fails, a valid recording remains available so you can enter its words manually.
 
@@ -162,6 +186,9 @@ Nemotron consumes each audio chunk once. The optional Whisper backend makes buff
 | `STT_MODEL_DIR` | Override the CPU recognition model directory under `data/models`. |
 | `STT_GPU_MODEL_DIR` | Override the CUDA recognition model directory under `data/models`. |
 | `T1000_ROOT` | Override the runtime root when using the Python package outside its checkout. |
+| `T1000_TTS_PROFILE` | `auto` by default: experimental `low-vram` on CUDA GPUs with 6 GiB or less; otherwise `standard`. Set `offload` for CPU-backed language-model layers. |
+| `T1000_TTS_OPTIMIZE` | `auto` by default: compile standard CUDA inference on GPUs with at least 12 GiB. `0` disables compilation; `1` explicitly enables it in the standard profile. Low-memory profiles stay eager. |
+| `T1000_TTS_GPU_LAYERS` | Offload profile only: number of Qwen blocks kept on GPU, default `0`. `14` keeps half its 28 decoder blocks resident, with a higher VRAM cost. |
 | `HF_HUB_OFFLINE` | Defaults to `1` in the app; explicit Hugging Face download commands use `0`. |
 | `GRADIO_ANALYTICS_ENABLED` | Defaults to `False`. |
 
@@ -178,6 +205,14 @@ Nemotron consumes each audio chunk once. The optional Whisper backend makes buff
 | `.venv/`, `node_modules/`, `apps/web/dist/` | The Python environment, npm dependencies, and built interface. |
 
 These runtime directories are ignored by Git. The Gradio fallback can also copy audio into its system temporary cache.
+
+The experimental 4–6 GB profiles need [additional dependencies](requirements/gpu-low-vram.txt).
+They offer NF4 language-model quantization or CPU layer offload while retaining
+SOAR's reference conditioning and acoustic modules. Fit, speed and voice fidelity
+still require a real GPU test. Standard compiled inference includes an initial
+warmup; subsequent requests reuse the loaded runtime. See
+[GPU inference performance](docs/setup.md#gpu-inference-performance) for setup and
+comparison commands that measure generation time and save audio for listening.
 
 ## Privacy and safety
 
@@ -250,7 +285,7 @@ npm run test:web
 git diff --check
 ```
 
-The suite currently contains 63 Python tests and six browser checks. Inference is mocked in regression tests; the browser checks exercise the real microphone worklet with a test clip. For another API port, set `PLAYWRIGHT_BASE_URL`, for example `http://127.0.0.1:7861`.
+The suite currently contains 109 Python tests and six browser checks. Full speech inference is mocked in regression tests; optional bitsandbytes and Accelerate tests exercise small real Qwen models. Browser checks exercise the real microphone worklet with a test clip. For another API port, set `PLAYWRIGHT_BASE_URL`, for example `http://127.0.0.1:7861`.
 
 ## Troubleshooting
 
@@ -309,7 +344,7 @@ Try the bundled voice and one short English sentence. Check that your own refere
 ## Limitations
 
 - This interface supports English inference; training and fine-tuning are not implemented.
-- CPU requests allow 150 text characters and references up to 10 seconds. CUDA requests allow 500 characters and references up to 30 seconds. References must be at least one second; uploads are capped at 32 MB.
+- CPU requests allow 150 text characters and references up to 10 seconds. Standard CUDA requests allow 500 characters and 30-second references; experimental low-memory profiles allow 150 characters and 6-second references. References must be at least one second; uploads are capped at 32 MB.
 - Generation has a 600-second budget. Cancellation waits for the current compute step.
 - Real GPU synthesis, combined TTS/ASR memory use, and minimum VRAM remain unverified on the receiving machine.
 - The previous CPU smoke run produced 1.92 seconds of audio in about 94 seconds, including model loading, on an Intel Core Ultra 9 185H. This is one sample, not a performance benchmark.
@@ -319,6 +354,7 @@ Try the bundled voice and one short English sentence. Check that your own refere
 | Guide | What's in it |
 | :--- | :--- |
 | [Setup](docs/setup.md) | GPU installation, pinned downloads, verification, and troubleshooting. |
+| [Docker](docs/docker.md) | Separate CPU/GPU builds, automatic model setup, persistent volumes, and container benchmarks. |
 | [Changelog](CHANGELOG.md) | Implementation changes and validation records. |
 | [Reference audio](assets/README.md) | Bundled clip provenance and its exact transcript. |
 | [Third-party notices](apps/web/NOTICE.md) | UI component and font sources and licenses. |
