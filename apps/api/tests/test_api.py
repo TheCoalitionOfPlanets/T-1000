@@ -37,6 +37,14 @@ class APITests(unittest.TestCase):
         self.client.close()
         self.directory.cleanup()
 
+    def test_health_reports_model_load_state_without_loading_weights(self):
+        api.voice.load_runtime.cache_clear()
+        response = self.client.get("/api/health")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {
+            "status": "ok", "device": api.voice.DEVICE, "speech_model_loaded": False,
+        })
+
     def test_config_example_and_audio_use_server_owned_identifiers(self):
         config = self.client.get("/api/config").json()
         self.assertEqual(config["text_limit"], api.TEXT_LIMIT)

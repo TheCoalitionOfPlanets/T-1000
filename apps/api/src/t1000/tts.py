@@ -19,6 +19,7 @@ import soundfile as sf
 import torch
 
 from . import stt
+from .inference_settings import get_inference_settings
 from .mic import consume_complete
 from .paths import ASSETS, CACHE, MODELS, OUTPUT
 
@@ -27,7 +28,9 @@ OUTPUT_DIR = OUTPUT
 EXAMPLE_AUDIO = ASSETS / "ref.wav"
 EXAMPLE_TRANSCRIPT = "We asked over twenty different people, and they all said it was his."
 DEVICE = "CUDA GPU" if torch.cuda.is_available() else "CPU"
-REFERENCE_LIMIT = 10 if DEVICE == "CPU" else 30
+INFERENCE_SETTINGS = get_inference_settings()
+REFERENCE_LIMIT = INFERENCE_SETTINGS.reference_limit
+TEXT_LIMIT = INFERENCE_SETTINGS.text_limit
 GENERATION_TIMEOUT = 600
 MODEL_LOCK = threading.Lock()
 ACTIVE_LOCK = threading.Lock()
@@ -43,13 +46,36 @@ def load_runtime():
 
     if not (MODEL_PATH / "model.safetensors").is_file():
         raise RuntimeError("Model weights are missing. Follow the README download instructions.")
+    settings = get_inference_settings()
+    if settings.profile == "low-vram":
+        from .low_vram import load_low_vram_runtime
+
+        LOGGER.info("Loading experimental low-VRAM SOAR: NF4 language backbone, eager acoustic decoding.")
+        return load_low_vram_runtime(MODEL_PATH, precision=settings.precision)
+    if settings.profile == "offload":
+        from .offload import load_offloaded_runtime
+
+        LOGGER.info("Loading experimental SOAR CPU offload with %s GPU-resident language blocks.", settings.gpu_layers)
+        return load_offloaded_runtime(MODEL_PATH, precision=settings.precision, gpu_layers=settings.gpu_layers)
+    optimize = settings.optimize
+    if optimize:
+        LOGGER.info(
+            "Loading SOAR with optimized CUDA inference. Initial compilation "
+            "and warmup can take several minutes; later requests reuse the runtime."
+        )
     runtime = DotsTtsRuntime.from_pretrained(
         str(MODEL_PATH),
-        precision="bfloat16" if torch.cuda.is_available() else "float32",
-        optimize=False,
-        max_generate_length=100 if DEVICE == "CPU" else 300,
+        precision=settings.precision,
+        optimize=optimize,
+        max_generate_length=settings.max_generate_length,
         vocoder_merge_steps=1,
+        warmup_on_optimize=False,
     )
+    if optimize:
+        # Match generate_stream's context so torch.compile can reuse the warmed
+        # graphs instead of specializing again for inference-mode tensors.
+        with torch.inference_mode():
+            runtime.run_warmup()
     if runtime.device.type == "cpu":
         torch.set_num_threads(min(6, os.cpu_count() or 1))
     return runtime
@@ -66,7 +92,7 @@ def read_reference(path):
     audio = audio.mean(axis=1)
     duration = audio.size / sample_rate
     if duration < 1:
-        raise ValueError("Record at least one second of speech; 3–10 seconds works best.")
+        raise ValueError(f"Record at least one second of speech; 3–{min(10, REFERENCE_LIMIT)} seconds works best.")
     peak = float(np.abs(audio).max())
     rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
     if peak < 0.0001 or rms < 0.00001:
@@ -211,9 +237,8 @@ def synthesize(text, reference_audio, transcript, steps, seed):
     transcript = (transcript or "").strip()
     if not text:
         raise gr.Error("Enter the text you want to hear.")
-    text_limit = 150 if DEVICE == "CPU" else 500
-    if len(text) > text_limit:
-        raise gr.Error(f"Keep each test under {text_limit} characters.")
+    if len(text) > TEXT_LIMIT:
+        raise gr.Error(f"Keep each test under {TEXT_LIMIT} characters.")
     if not reference_audio:
         raise gr.Error("Add a reference recording, or keep the preloaded example voice.")
     if not transcript:
@@ -244,6 +269,9 @@ def synthesize(text, reference_audio, transcript, steps, seed):
                 from dots_tts.utils.util import seed_everything
 
                 runtime = load_runtime()
+                if cancel.is_set():
+                    return
+                messages.put(("ready", None))
                 if runtime.device.type == "cpu":
                     torch.set_num_threads(min(6, os.cpu_count() or 1))
                 seed_everything(int(seed))
@@ -282,9 +310,10 @@ def synthesize(text, reference_audio, transcript, steps, seed):
     sample_rate = 48000
     error = None
     timed_out = False
+    runtime_ready = False
     worker.start()
     try:
-        yield gr.skip(), "Preparing your reference recording…", gr.update(interactive=False), gr.update(interactive=True)
+        yield gr.skip(), "Loading the speech model and preparing inference…", gr.update(interactive=False), gr.update(interactive=True)
         while True:
             elapsed = time.perf_counter() - started
             if elapsed >= GENERATION_TIMEOUT:
@@ -296,6 +325,8 @@ def synthesize(text, reference_audio, transcript, steps, seed):
                     break
                 if kind == "error":
                     error = payload
+                elif kind == "ready":
+                    runtime_ready = True
                 elif kind == "audio":
                     audio, sample_rate = payload
                     chunks.append(audio)
@@ -305,6 +336,10 @@ def synthesize(text, reference_audio, transcript, steps, seed):
             if cancel.is_set():
                 reason = "Time limit reached" if timed_out else "Stop requested"
                 status = f"{reason}; finishing the current audio step… Elapsed {elapsed:.0f}s."
+            elif not runtime_ready:
+                status = f"Loading and warming the speech model · elapsed {elapsed:.0f}s."
+                if DEVICE != "CPU":
+                    status += " First GPU use can take several minutes."
             else:
                 status = f"Generating on {DEVICE} · elapsed {elapsed:.0f}s · produced {duration:.2f}s of audio."
             yield gr.skip(), status, gr.update(interactive=False), gr.update(interactive=True)

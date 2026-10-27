@@ -1,6 +1,6 @@
 # T-1000 setup
 
-Updated: 2026-10-26. Repository: https://github.com/TheCoalitionOfPlanets/T-1000
+Updated: 2026-10-27. Repository: https://github.com/TheCoalitionOfPlanets/T-1000
 
 ## Goal and current state
 
@@ -74,6 +74,10 @@ UV_CACHE_DIR="$PWD/.cache/uv" uv pip install --python .venv/bin/python \
 uv pip check --python .venv/bin/python
 ```
 
+For a 4–6 GB GPU, replace `requirements/gpu.txt` in the installation command with
+`requirements/gpu-low-vram.txt`. This adds bitsandbytes 0.50.2 and Accelerate 1.15.0
+for the experimental quantization and CPU layer-offload profiles below.
+
 CUDA 12.8 is one of the builds published for PyTorch 2.8.0 in the
 [official version instructions](https://pytorch.org/get-started/previous-versions/#v280).
 Use a driver compatible with that build. If the machine needs a different build,
@@ -93,15 +97,16 @@ print('CUDA build:', torch.version.cuda)
 assert torch.cuda.is_available(), 'CUDA unavailable: check driver, torch build, and GPU visibility'
 print('GPU:', torch.cuda.get_device_name(0))
 print('VRAM (GiB):', torch.cuda.get_device_properties(0).total_memory / 2**30)
-print('BF16 supported:', torch.cuda.is_bf16_supported())
-assert torch.cuda.is_bf16_supported(), 'This app selects BF16 on CUDA; review precision for this GPU before launching'
+print('GPU precision:', 'BF16' if torch.cuda.is_bf16_supported() else 'FP16')
 print('GPU tensor:', (torch.ones(1, device='cuda') + 1).item())
 PY
 ```
 
-The app selects BF16 whenever CUDA is available. Older GPUs without BF16 need a
-reviewed precision change in `load_runtime()` before using this path; FP32 uses
-more memory. AMD/Intel GPU execution is not covered by these CUDA instructions.
+The app selects BF16 on supported CUDA GPUs and otherwise FP16. FP16 numerical
+behavior and audio quality need validation on the particular GPU. Its architecture
+must also be supported by the chosen PyTorch and bitsandbytes CUDA wheels;
+VRAM capacity alone does not establish compatibility. AMD/Intel GPU execution is
+not covered by these CUDA instructions.
 For native Windows PowerShell, use `.venv\Scripts\python.exe` instead of
 `.venv/bin/python` and PowerShell environment-variable syntax instead of the
 Unix inline assignments; Linux/WSL2 is the documented command sequence.
@@ -175,7 +180,7 @@ and seed 42 for the first generation. Confirm that the device and generation
 status report `CUDA GPU`, listen to
 the output, and check a WAV was saved under `data/output/`. Confirm the runtime log
 reports `device=cuda` after the first request loads the checkpoint.
-For a different voice, click **Record voice**, speak a clear 3–10 second
+For a different voice, click **Record voice**, speak a clear 3–6 second
 sentence, then **Finish recording**. Confirm words appear during recording and
 the editable transcript fills automatically. Uploading a clip also transcribes
 it. Check the recognized words before generating. Replacing audio invalidates
@@ -184,8 +189,10 @@ If ASR fails, its setup error is shown and complete audio remains available for
 manual transcription. A current browser with AudioWorklet and microphone
 permission is required, on localhost or HTTPS.
 
-GPU text is limited to 500 characters; CPU text to 150 characters. References
-are limited to 10 seconds with CPU TTS and 30 seconds with CUDA TTS. Generation
+Standard GPU text is limited to 500 characters; CPU text to 150 characters.
+References are limited to 10 seconds with CPU TTS and 30 seconds with standard
+CUDA TTS. Experimental low-memory profiles use 150 characters and 6-second
+references. Generation
 has a 600-second budget. **Stop generation** and the
 deadline request cancellation after the current audio step and preserve any
 partial output; they do not immediately interrupt a running CUDA operation.
@@ -203,6 +210,106 @@ For frontend editing, keep `.venv/bin/python -m t1000` running and use
 `/api` requests to port 7860. The original Gradio interface is available with
 `.venv/bin/python -m t1000.ui` and preloads the model at startup. Stop `t1000.api`
 before using it because both entry points bind port 7860.
+
+## GPU inference performance
+
+The `auto` profile selects experimental NF4 inference on CUDA GPUs with 6 GiB or
+less, and standard inference otherwise. Standard inference automatically compiles
+only on GPUs with at least 12 GiB, because the compiled flow-decoder caches and
+warmup can use substantial memory. `T1000_TTS_OPTIMIZE=1` explicitly enables that
+path in the standard profile; `0` disables it. CPU inference stays eager.
+
+All profiles use the local SOAR checkpoint, full reference audio/text conditioning,
+sampling controls and one-patch vocoder chunks. Standard and offload profiles keep
+unquantized weights. Quantized or compiled arithmetic can change output, so
+compare voice similarity, tone, pacing, pronunciation and completeness.
+
+### Experimental 4–6 GB profiles
+
+The current checkpoint contains approximately 4.795 GiB of tensor weights before
+CUDA context, activations or decoding caches: 4.094 GiB in the BF16 core, 0.674 GiB
+in the FP32 vocoder and 0.027 GiB in the speaker encoder. Those are measurements
+of the local safetensors headers, not GPU peak-memory measurements. The full
+resident checkpoint cannot fit on a 4 GiB GPU by merely disabling compilation.
+
+| Profile | Placement | Tradeoff |
+| --- | --- | --- |
+| `low-vram` | NF4 linear projections in the language-model transformer blocks; other modules retain normal precision. | Approximately 2.97 GiB of raw weight storage before quantization metadata and inference overhead. Voice and delivery can change; speed depends on GPU kernels. |
+| `offload`, GPU layers `0` | Acoustic modules and token embeddings stay on CUDA; language blocks are stored in CPU RAM and loaded onto CUDA for each forward call. | Preserves unquantized weights and lowers resident VRAM, but repeated transfers generally increase latency. |
+| `offload`, GPU layers `14` | Keep half the bundled language model's 28 decoder blocks on CUDA and offload the rest. | Fewer transfers, more VRAM. This is not half of the complete TTS model, and may be too large for 4 GB. |
+
+Both low-memory modes disable compilation, cap the runtime at 128 total audio
+patches and a 512-position language context, and accept at most 150 text characters
+and 6-second references. Long utterances can hit the audio cap; listen for complete
+speech. Use the default CPU transcription backend so ASR does not compete for VRAM.
+The full checkpoint is still loaded into CPU RAM initially: these profiles do not
+provide disk streaming or reduce the initial host-RAM requirement.
+
+After installing the low-VRAM requirements, launch either profile explicitly:
+
+```sh
+T1000_TTS_PROFILE=low-vram .venv/bin/python -m t1000
+T1000_TTS_PROFILE=offload T1000_TTS_GPU_LAYERS=0 .venv/bin/python -m t1000
+```
+
+Only run one server at a time. Restart to change profiles. Automatic selection on
+a 4–6 GB GPU chooses `low-vram`; an explicitly enabled compile flag must be removed
+or set to `0` for either low-memory profile. A GPU's total VRAM includes space
+needed by the display and other programs, so short-request fit still needs testing.
+
+### Measure memory, speed and audio quality
+
+Run each approach in a separate process on the actual GPU:
+
+```sh
+.venv/bin/python scripts/benchmark_tts.py --mode low-vram --output-dir data/output/bench-nf4
+.venv/bin/python scripts/benchmark_tts.py --mode offload --gpu-layers 0 --output-dir data/output/bench-offload
+.venv/bin/python scripts/benchmark_tts.py --mode offload --gpu-layers 14 --output-dir data/output/bench-half
+```
+
+Start offload with zero resident decoder blocks on 4 GB. Increase the count only
+after measuring headroom. Neither profile has been verified within a 4 GB ceiling
+on the CPU-only development machine.
+
+The first model load runs upstream compilation and warmup, which can take several
+minutes and uses extra GPU memory when standard compilation is enabled. In the web app it currently counts toward the
+600-second request budget. Stop requests wait for this operation to return. Later
+requests reuse the loaded runtime. Restart with optimization disabled if the GPU
+encounters a compile failure, excessive memory use or a cold-start timeout:
+
+```sh
+T1000_TTS_OPTIMIZE=0 .venv/bin/python -m t1000
+```
+
+For larger GPUs, compare standard eager and compiled inference separately:
+
+```sh
+.venv/bin/python scripts/benchmark_tts.py --mode eager --output-dir data/output/bench-eager
+.venv/bin/python scripts/benchmark_tts.py --mode optimized --output-dir data/output/bench-optimized
+```
+
+The benchmark keeps the bundled voice, transcript, text, ten sampling steps,
+guidance 1.2 and seed 42 the same. It selects BF16 when supported, otherwise FP16;
+use the same precision in every comparison. It separates model loading/warmup from warm
+requests and reports time to the first audio chunk, complete generation time,
+audio duration, real-time factor (generation seconds / audio seconds), and peak
+CUDA memory, including separate peak-memory counters during loading. A real-time
+factor below 1 means generation is faster than playback.
+JSON reports and WAV samples are saved in each output directory. Listen to both
+sets; speed alone does not establish preserved voice similarity or fluent delivery.
+
+Use the same `--text`, `--reference` and `--transcript` arguments in both commands
+to compare your own voice. Run `--help` for all options. Optional stage profiling
+adds CUDA synchronization overhead, so keep it off when measuring normal latency.
+Low-memory profiles fix their audio cap at 128 patches; pass
+`--max-generate-length 128` to standard benchmark runs when comparing across
+profiles. The benchmark enforces each profile's text and reference limits;
+start with short inputs and check that output is complete.
+Real GPU performance remains unverified on the CPU-only development machine.
+
+The browser currently receives status updates during synthesis and plays a WAV
+after generation completes. The benchmark's first-chunk measurement describes
+the model output; it is not browser playback latency.
 
 ## Troubleshooting and next-agent completion record
 

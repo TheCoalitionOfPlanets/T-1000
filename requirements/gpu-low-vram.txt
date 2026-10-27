@@ -1,0 +1,5 @@
+# Experimental NF4 language-backbone and CPU layer-offload profiles.
+-r gpu.txt
+
+bitsandbytes==0.50.2
+accelerate==1.15.0

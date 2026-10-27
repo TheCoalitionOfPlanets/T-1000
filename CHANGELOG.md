@@ -1,5 +1,52 @@
 # Changelog
 
+## 2026-10-27 — Separate CPU and GPU Docker deployments
+
+- Added separate multi-stage CPU and CUDA Dockerfiles and Compose configurations.
+  Each builds the React UI and installs its Python dependency profile; the GPU
+  image includes quantization/offload dependencies and CUDA 12.8 Torch wheels.
+- Added startup provisioning for pinned SOAR weights and verified CPU recognition,
+  persistent model/cache volumes, model preload, device checks and a health endpoint.
+  Completed marked snapshots skip repeat downloads; offline local-model reuse is
+  explicit. One server worker serves the UI/API after preparation.
+- Run as a nonroot user, bind the published port to localhost, and exclude local
+  model files, recordings, dependencies and private files from the build context.
+- Documented one-command startup, NVIDIA prerequisites, volume reuse and GPU
+  benchmark commands.
+
+Validation: 109 Python tests pass, including provisioning, download failure,
+offline reuse, startup ordering, device validation and health status. Both images
+build and both Compose configurations validate. The nonroot CPU container preloads
+real local models, passes six Chromium checks and a live UI/API check, transcribes
+the bundled clip, and generates a finite 48 kHz WAV (0.64 seconds in 29.0 seconds
+for “Hi.” at four steps). Named-volume permissions and pinned-model download
+access were checked. GPU image imports and its no-CUDA startup failure pass;
+real CUDA synthesis and 4–6 GB memory fit still require hardware testing.
+
+## 2026-10-27 — GPU inference and experimental low-memory profiles
+
+- Added automatic profile selection: experimental LLM-only NF4 on CUDA GPUs with
+  6 GiB or less; standard inference otherwise. Automatic compilation requires
+  at least 12 GiB; explicit enable/disable flags remain available.
+- Added unquantized CPU layer offload, with a configurable number of resident
+  Qwen blocks. Initial placement avoids transferring the complete dense model
+  to CUDA, and tied embeddings remain shared.
+- Preserved SOAR reference conditioning, acoustic modules, sampling controls and
+  one-patch vocoder chunks. Select BF16 when supported and FP16 otherwise. Bound
+  low-memory inputs/context, and match compiled warmup to the inference context.
+- Show model warmup in generation status and honor stop requests made during
+  loading before starting audio synthesis.
+- Added a GPU benchmark that separates startup and warm generation, measures
+  first audio, total time, real-time factor and memory, and saves comparable WAVs
+  and JSON reports. Optional stage profiling runs separately from speed timings.
+
+Validation: 90 Python tests pass, including profile selection, placement,
+quantization boundaries, runtime reuse and cancellation during loading. Small real
+Qwen models verify bitsandbytes quantization order and Accelerate prefill/cached
+decode hooks on CPU. Dependency checks, benchmark help, argument validation and
+the no-CUDA failure path pass. Real 4–6 GB fit, GPU speed and voice/delivery
+equivalence remain unverified on this CPU-only machine.
+
 ## 2026-10-26 — Project README
 
 - Adopted the supplied README format with setup, usage, configuration, privacy,

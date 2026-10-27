@@ -1,6 +1,9 @@
 /data/
 /.cache/
 /.venv/
+/.env
+/.env.*
+!/.env.example
 __pycache__/
 *.py[cod]
 node_modules/
