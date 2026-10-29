@@ -21,6 +21,7 @@ import torch
 from . import stt
 from .inference_settings import get_inference_settings
 from .eager import configure_eager_cache, read_eager_cache_enabled
+from .compiled_vocoder import configure_compiled_vocoder, read_compiled_vocoder_enabled
 from .references import configure_prompt_audio
 from .mic import consume_complete
 from .paths import ASSETS, CACHE, MODELS, OUTPUT
@@ -50,13 +51,17 @@ def load_runtime():
         raise RuntimeError("Model weights are missing. Follow the README download instructions.")
     settings = get_inference_settings()
     eager_cache = read_eager_cache_enabled()
+    compiled_vocoder = read_compiled_vocoder_enabled()
+    if compiled_vocoder and settings.profile != "low-vram":
+        raise ValueError("T1000_TTS_COMPILE_VOCODER=1 requires the low-vram profile.")
     if settings.profile == "low-vram":
         from .low_vram import load_low_vram_runtime
 
         LOGGER.info("Loading experimental low-VRAM SOAR: NF4 language backbone, eager acoustic decoding.")
         runtime = load_low_vram_runtime(MODEL_PATH, precision=settings.precision)
         configure_prompt_audio(runtime)
-        return configure_eager_cache(runtime, eager_cache)
+        configure_eager_cache(runtime, eager_cache)
+        return configure_compiled_vocoder(runtime, enabled=compiled_vocoder)
     if settings.profile == "offload":
         from .offload import load_offloaded_runtime
 

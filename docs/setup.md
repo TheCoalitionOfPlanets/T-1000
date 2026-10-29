@@ -446,3 +446,13 @@ reference; cold initialization 1.69 s, warm incremental recognition including
 final flush about 0.90 s, first partial after 1.0 s of input. Spoken words matched;
 punctuation differed. GPU ASR was checked with mocks and import/API validation
 only; measure recording-to-partial latency and peak VRAM on the receiving GPU.
+
+### Vocoder-only SOAR compilation on the tested RTX 3050
+
+`T1000_TTS_COMPILE_VOCODER=1` enables the isolated convolutional decoder compiler in the eager NF4 `low-vram` profile. It disables CUDA graphs and leaves SOAR sampling, FP32 vocoder parameters, reference processing and configured buffering unchanged (benchmarked at ten steps and four-patch buffering). Compilation and a throwaway buffered stream warm during runtime loading; use `T1000_PRELOAD_MODELS=1` so this finishes before the API becomes ready. Cold compiler warmup can add tens of seconds; warm generation measurements exclude it. Other profiles reject this opt-in rather than silently changing behavior.
+
+```bash
+T1000_TTS_PROFILE=low-vram T1000_TTS_OPTIMIZE=0 T1000_TTS_VOCODER_BATCH_SIZE=4 T1000_TTS_COMPILE_VOCODER=1 T1000_PRELOAD_MODELS=1 .venv/bin/python -m t1000
+```
+
+The default remains `0`; disabling the flag and restarting restores the previous eager vocoder. The ordered native-LSTM, compiler, rotary-reuse, decoder-precision and batch-eight experiments and paired listening evidence are saved in `data/output/3050-soar-optimizations/`. Experimental adapters stay off unless explicitly selected by the benchmark runner; production enables only the compiler flag.

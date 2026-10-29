@@ -188,6 +188,7 @@ Nemotron consumes each audio chunk once. The optional Whisper backend makes buff
 | `T1000_ROOT` | Override the runtime root when using the Python package outside its checkout. |
 | `T1000_TTS_PROFILE` | `auto` by default: experimental `low-vram` on CUDA GPUs with 6 GiB or less; otherwise `standard`. Set `offload` for CPU-backed language-model layers. |
 | `T1000_TTS_OPTIMIZE` | `auto` by default: compile standard CUDA inference on GPUs with at least 12 GiB. `0` disables compilation; `1` explicitly enables it in the standard profile. Low-memory profiles stay eager. |
+| `T1000_TTS_COMPILE_VOCODER` | `0` by default. Set `1` for the tested vocoder-only compiler on eager `low-vram` CUDA. Warms during runtime loading; leaves SOAR sampling, FP32 vocoder precision and configured buffering unchanged. Combine with `T1000_PRELOAD_MODELS=1` to finish warmup before readiness. |
 | `T1000_TTS_GPU_LAYERS` | Offload profile only: number of Qwen blocks kept on GPU, default `0`. `14` keeps half its 28 decoder blocks resident, with a higher VRAM cost. |
 | `HF_HUB_OFFLINE` | Defaults to `1` in the app; explicit Hugging Face download commands use `0`. |
 | `GRADIO_ANALYTICS_ENABLED` | Defaults to `False`. |
