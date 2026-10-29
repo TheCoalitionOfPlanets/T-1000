@@ -79,6 +79,10 @@ export default function App() {
   const [config, setConfig] = useState<Config | null>(null)
   const [connectionError, setConnectionError] = useState("")
   const [text, setText] = useState("Hello, this is a voice test.")
+  const [normalizing, setNormalizing] = useState(false)
+  const [textPreview, setTextPreview] = useState<{ original: string; expanded: string } | null>(null)
+  const [normalizationError, setNormalizationError] = useState("")
+  const [originalText, setOriginalText] = useState<string | null>(null)
   const [reference, setReference] = useState<Reference | null>(null)
   const [referenceName, setReferenceName] = useState("Example voice")
   const [transcript, setTranscript] = useState("")
@@ -101,6 +105,8 @@ export default function App() {
   const recorder = useRef<VoiceRecorder | null>(null)
   const generationController = useRef<AbortController | null>(null)
   const referenceController = useRef<AbortController | null>(null)
+  const normalizationController = useRef<AbortController | null>(null)
+  const normalizationVersion = useRef(0)
   const fileInput = useRef<HTMLInputElement>(null)
   const textInput = useRef<HTMLTextAreaElement>(null)
 
@@ -116,14 +122,55 @@ export default function App() {
 
   useEffect(() => {
     void connect()
-    const cancel = () => { void recorder.current?.cancel(); generationController.current?.abort(); referenceController.current?.abort() }
+    const cancel = () => { void recorder.current?.cancel(); generationController.current?.abort(); referenceController.current?.abort(); normalizationController.current?.abort() }
     window.addEventListener("pagehide", cancel)
     return () => { cancel(); window.removeEventListener("pagehide", cancel) }
   }, [])
 
   const referenceLocked = busy || referenceBusy || recording
   const validSeed = /^\d+$/.test(seed) && Number(seed) <= 4294967295
-  const canGenerate = !!config && !!reference && !!text.trim() && !!transcript.trim() && text.length <= config.text_limit && validSeed && !referenceLocked
+  const canGenerate = !!config && !!reference && !!text.trim() && !!transcript.trim() && text.length <= config.text_limit && validSeed && !referenceLocked && !normalizing && !textPreview
+
+  function cancelExpansion() {
+    normalizationVersion.current++
+    normalizationController.current?.abort()
+    normalizationController.current = null
+    setNormalizing(false)
+    setTextPreview(null)
+    setNormalizationError("")
+  }
+
+  function changeText(next: string) {
+    cancelExpansion()
+    setOriginalText(null)
+    setText(next)
+  }
+
+  async function expandNumbers() {
+    if (!config || busy || normalizing || !text.trim() || text.length > config.text_limit) return
+    cancelExpansion()
+    const version = normalizationVersion.current
+    const original = text
+    const controller = new AbortController()
+    normalizationController.current = controller
+    setNormalizing(true)
+    try {
+      const result = await post<{ text: string }>("/api/text/normalize", { text: original }, controller.signal)
+      if (version === normalizationVersion.current) setTextPreview({ original, expanded: result.text })
+    } catch (error) {
+      if (version === normalizationVersion.current && !controller.signal.aborted) setNormalizationError(error instanceof Error ? error.message : "Text expansion is unavailable. Your original text is still here.")
+    } finally {
+      if (version === normalizationVersion.current) { setNormalizing(false); normalizationController.current = null }
+    }
+  }
+
+  function applyExpansion() {
+    if (!textPreview || text !== textPreview.original) return
+    const selected = textPreview
+    changeText(selected.expanded)
+    setOriginalText(selected.original)
+    textInput.current?.focus()
+  }
 
   function useExample() {
     if (!config?.example) return
@@ -232,8 +279,13 @@ export default function App() {
           <div className="creation-column">
             <section className="panel editor-panel" aria-labelledby="text-heading">
               <div className="panel-heading"><h2 id="text-heading"><span className="step-number">01</span>What would you like to say?</h2><span className="small-label">English</span></div>
-              <div className="text-editor"><label className="sr-only" htmlFor="speech-text">Text to speak</label><textarea id="speech-text" ref={textInput} value={text} disabled={busy} placeholder="Every great voice starts with a few words…" onChange={event => setText(event.target.value)} onKeyDown={event => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") { event.preventDefault(); void synthesize() } }} /><div className="editor-meta"><span><span className="subtle-dot" />Let your words do the talking.</span><span className={config && text.length > config.text_limit ? "over-limit" : ""}>{text.length}<span> / {config?.text_limit ?? "—"}</span></span></div></div>
-              <div className="inspiration"><span>NEED A FIRST LINE?</span><div>{phrases.map(phrase => <button key={phrase.name} disabled={busy} onClick={() => { setText(phrase.text); textInput.current?.focus() }}><Plus size={12} />{phrase.name}</button>)}</div></div>
+              <div className="text-editor"><label className="sr-only" htmlFor="speech-text">Text to speak</label><textarea id="speech-text" ref={textInput} value={text} disabled={busy} placeholder="Every great voice starts with a few words…" onChange={event => changeText(event.target.value)} onKeyDown={event => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") { event.preventDefault(); void synthesize() } }} /><div className="editor-meta"><span><span className="subtle-dot" />Let your words do the talking.</span><span className={config && text.length > config.text_limit ? "over-limit" : ""}>{text.length}<span> / {config?.text_limit ?? "—"}</span></span></div></div>
+              <div className="text-expansion">
+                <div className="text-tools"><Button variant="ghost" size="sm" disabled={!config || busy || normalizing || !text.trim() || text.length > config.text_limit} onClick={() => void expandNumbers()}>{normalizing ? <><LoaderCircle size={13} className="spin" />Expanding…</> : "Expand numbers"}</Button>{originalText !== null && <Button variant="ghost" size="sm" disabled={busy || normalizing} onClick={() => { changeText(originalText); textInput.current?.focus() }}>Undo expansion</Button>}{normalizing && <Button variant="ghost" size="sm" onClick={cancelExpansion}>Cancel</Button>}</div>
+                {textPreview && <section className="spoken-text-preview" aria-labelledby="spoken-text-heading"><h3 id="spoken-text-heading">Spoken text preview</h3><p className="spoken-text-content">{textPreview.expanded}</p><p className="spoken-text-note">Review numbers, dates, phone numbers and abbreviations before applying. Edit the text if you want a different reading.</p><div className="text-tools"><Button variant="outline" size="sm" onClick={applyExpansion}>Apply</Button><Button variant="ghost" size="sm" onClick={cancelExpansion}>Cancel</Button></div></section>}
+                {normalizationError && <p className="field-error" role="alert">{normalizationError}</p>}
+              </div>
+              <div className="inspiration"><span>NEED A FIRST LINE?</span><div>{phrases.map(phrase => <button key={phrase.name} disabled={busy} onClick={() => { changeText(phrase.text); textInput.current?.focus() }}><Plus size={12} />{phrase.name}</button>)}</div></div>
               <div className="generate-bar"><div className="generation-hint"><Sparkles size={16} /><span>Your words, a new dimension.</span></div>{busy ? <Button className="stop-button" disabled={stopping} onClick={() => void stop()}><Square size={14} fill="currentColor" />{stopping ? "Stopping…" : "Stop generation"}</Button> : <Button className="generate-button" disabled={!canGenerate} onClick={() => void synthesize()}><AudioLines size={17} />Generate speech<ArrowRight size={16} /></Button>}</div>
             </section>
 

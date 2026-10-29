@@ -1,0 +1,17 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "overused-font",
+        "value": "instrument sans",
+        "files": [
+          "apps/web/src/styles.css"
+        ],
+        "createdAt": "2026-10-29T04:55:42.031Z",
+        "reason": "Agent triage: the regular/bold font-face declarations and root font stack are unchanged from HEAD, with bundled font assets and NOTICE.md attribution; preserving the incumbent typography during the latency and accuracy work."
+      }
+    ]
+  }
+}

@@ -1,6 +1,6 @@
 # T-1000 setup
 
-Updated: 2026-10-28. Repository: https://github.com/TheCoalitionOfPlanets/T-1000
+Updated: 2026-10-29. Repository: https://github.com/TheCoalitionOfPlanets/T-1000
 
 ## Goal and current state
 
@@ -262,6 +262,11 @@ kernel rounding can produce small waveform differences. Stop can wait for up
 to four acoustic patches between output chunks. This setting applies only to
 the eager NF4 loader; standard and compiled inference retain upstream behavior.
 
+`T1000_TTS_EAGER_CACHE=1` additionally reuses voice-conditioned Euler timestep
+projections within a generation, without changing the upstream solver or
+sampling steps. It defaults to `0` and bypasses unsupported solver modes.
+The tested gain was small; see the pipeline measurements below.
+
 Only run one server at a time. Restart to change profiles. Automatic selection on
 a 4–6 GB GPU chooses `low-vram`; an explicitly enabled compile flag must be removed
 or set to `0` for either low-memory profile. A GPU's total VRAM includes space
@@ -397,6 +402,44 @@ establish small aggregate numerical error rather than bit-identical audio or
 subjective perceptual equivalence. Separate synchronized profiles attributed
 most of the gain to vocoding, which fell from 3.33 to 2.10 seconds. Profiling
 requests were excluded from the timed medians.
+
+### Pipeline validation — 2026-10-29
+
+With the same RTX 3050, reference, seed and ten Euler steps, a two-run resident
+model comparison measured 5.709 seconds without the conditioning cache and
+5.578 seconds with it (2.3% lower). Generated float samples were bit-identical.
+This is a small measured difference, not a statistical speed guarantee.
+
+The runtime now preserves every reference sample by default, preventing the
+upstream 30 dB trim from silently removing quiet opening/closing phonemes.
+`T1000_REFERENCE_TRIM=1` explicitly restores the old trimming. CPU preprocessing
+is cached by audio content with an eight-entry/16 MiB limit. Speaker/latent
+features retain the upstream cache; no extra prompt cache is placed on CUDA.
+Preserving a full reference can change pacing and output length, so timings
+between trimmed and complete references are not directly interchangeable.
+
+With complete reference audio and the conditioning cache, all four test
+sentences matched their requested words in normalized ASR checks. The short
+sentence produced 1.92 seconds of audio in 5.73 seconds; the 100-character
+sentence produced 7.04 seconds in 22.81 seconds. These checks do not measure
+subjective speaker similarity or establish a general word-error rate.
+
+Use **Expand numbers** to preview English number/abbreviation expansions, then
+review and Apply or Cancel. Undo restores the original. The tool does not
+change reference transcripts, and ambiguous formatted phone numbers require
+manual spelling. Dates and money still need review for the intended reading.
+
+For the local API, `T1000_PRELOAD_MODELS=1` loads TTS and CPU recognition before
+opening the server, moving model loading into startup. This delays readiness
+instead of making loading itself faster. The default remains lazy loading.
+API NDJSON includes `elapsed_ms` and reference-validation/first-status/completion
+milestones; first status is not first audio. The browser client also measures
+request headers, first event and completion without showing implementation
+metrics in the normal voice workflow.
+
+Validation: 150 backend tests on both machines, nine frontend checks and both
+production builds passed. Model/profile changes and shorter sampling schedules
+still require separate speed, word-error and voice-quality comparisons.
 
 Source CPU recognition smoke: Core Ultra 9 185H, four threads, included 3.904 s
 reference; cold initialization 1.69 s, warm incremental recognition including

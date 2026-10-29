@@ -2,6 +2,7 @@ import asyncio
 import base64
 import io
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -45,12 +46,64 @@ class APITests(unittest.TestCase):
             "status": "ok", "device": api.voice.DEVICE, "speech_model_loaded": False,
         })
 
+    def test_opt_in_preload_finishes_before_server_accepts_requests(self):
+        events = []
+        with patch.dict(os.environ, {"T1000_PRELOAD_MODELS": "1"}), \
+                patch.object(api.voice, "load_runtime", side_effect=lambda: events.append("tts")), \
+                patch.object(api.voice.stt, "preload_cpu_model", side_effect=lambda: events.append("stt")), \
+                patch("uvicorn.run", side_effect=lambda *a, **k: events.append("serve")):
+            api.main()
+        self.assertEqual(events, ["tts", "stt", "serve"])
+
+    def test_invalid_preload_setting_fails_before_model_or_server_start(self):
+        with patch.dict(os.environ, {"T1000_PRELOAD_MODELS": "maybe"}), \
+                patch.object(api.voice, "load_runtime") as load, \
+                patch("uvicorn.run") as serve:
+            with self.assertRaisesRegex(ValueError, "T1000_PRELOAD_MODELS"):
+                api.main()
+        load.assert_not_called()
+        serve.assert_not_called()
+
+    def test_preload_tts_failure_is_reported_before_server_start(self):
+        with patch.dict(os.environ, {"T1000_PRELOAD_MODELS": "1"}), \
+                patch.object(api.voice, "load_runtime", side_effect=RuntimeError("missing weights")), \
+                patch("uvicorn.run") as serve:
+            with self.assertRaisesRegex(RuntimeError, "missing weights"):
+                api.main()
+        serve.assert_not_called()
+
     def test_config_example_and_audio_use_server_owned_identifiers(self):
         config = self.client.get("/api/config").json()
         self.assertEqual(config["text_limit"], api.TEXT_LIMIT)
         self.assertEqual(config["example"]["id"], "example")
         self.assertEqual(self.client.get(config["example"]["url"]).content, api.voice.EXAMPLE_AUDIO.read_bytes())
         self.assertEqual(self.client.get("/api/audio/not-a-local-path").status_code, 404)
+
+    def test_text_expansion_returns_proposal_without_generating(self):
+        with patch.object(api, "expand_english_text", return_value="Pay twelve dollars.") as normalize, patch.object(api.voice, "synthesize") as generate:
+            response = self.client.post("/api/text/normalize", json={"text": "Pay $12."})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"text": "Pay twelve dollars."})
+        normalize.assert_called_once_with("Pay $12.", max_length=api.TEXT_LIMIT)
+        generate.assert_not_called()
+
+    def test_text_expansion_rejects_oversized_input_and_transcript_fields(self):
+        with patch.object(api, "expand_english_text") as normalize:
+            for payload in ({"text": "x" * (api.TEXT_LIMIT + 1)}, {"text": "Hello", "transcript": "Reference words"}):
+                response = self.client.post("/api/text/normalize", json=payload)
+                self.assertEqual(response.status_code, 422)
+        normalize.assert_not_called()
+
+    def test_text_expansion_errors_preserve_actionable_messages(self):
+        message = "Expanded text has 151 characters; shorten the original to fit the 150-character limit."
+        with patch.object(api, "expand_english_text", side_effect=ValueError(message)):
+            response = self.client.post("/api/text/normalize", json={"text": "123"})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"], message)
+        with patch.object(api, "expand_english_text", side_effect=RuntimeError("internal details")), self.assertLogs(api.LOGGER, level="WARNING"):
+            response = self.client.post("/api/text/normalize", json={"text": "123"})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Text expansion is unavailable. Keep or edit your original text.")
 
     def test_config_sample_is_stable_and_audio_supports_byte_ranges(self):
         sample = self.root / "test-english.wav"
@@ -109,8 +162,33 @@ class APITests(unittest.TestCase):
         events = [json.loads(line) for line in result.text.splitlines()]
         self.assertFalse(events[0]["done"])
         self.assertTrue(events[-1]["done"])
+        elapsed = [event["elapsed_ms"] for event in events]
+        self.assertEqual(elapsed, sorted(elapsed))
+        for event in events:
+            timings = event["timings"]
+            self.assertGreaterEqual(timings["reference_validated_ms"], 0)
+            self.assertLessEqual(timings["reference_validated_ms"], timings["first_status_ms"])
+            self.assertLessEqual(timings["first_status_ms"], event["elapsed_ms"])
+        self.assertNotIn("completion_ms", events[0]["timings"])
+        self.assertEqual(events[-1]["timings"]["completion_ms"], elapsed[-1])
         self.assertEqual(self.client.get(events[-1]["audio_url"]).content, output.read_bytes())
         self.assertEqual(generate.call_args.args[1], str(api.voice.EXAMPLE_AUDIO))
+        self.assertFalse(api.generation_lock.locked())
+
+    def test_stream_error_keeps_timing_milestones_and_releases_slot(self):
+        def synthesize(*args):
+            yield gr.skip(), "Generating", gr.update(interactive=False), gr.update(interactive=True)
+            raise RuntimeError("decode failed")
+
+        with patch.object(api.voice, "synthesize", side_effect=synthesize), self.assertLogs(api.LOGGER, level="ERROR"):
+            result = self.client.post("/api/generate", json={"text": "Hello", "reference_id": "example", "transcript": "Words"})
+        events = [json.loads(line) for line in result.text.splitlines()]
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(events[-1]["error"], "decode failed")
+        self.assertTrue(events[-1]["done"])
+        self.assertGreaterEqual(events[-1]["elapsed_ms"], events[0]["elapsed_ms"])
+        self.assertEqual(events[-1]["timings"]["completion_ms"], events[-1]["elapsed_ms"])
+        self.assertEqual(events[-1]["timings"]["reference_validated_ms"], events[0]["timings"]["reference_validated_ms"])
         self.assertFalse(api.generation_lock.locked())
 
     def test_running_generation_rejects_second_request(self):

@@ -102,6 +102,13 @@ textarea::placeholder { color: #838c78; }
 .editor-meta > span:last-child { font-variant-numeric: tabular-nums; color: #747e64; }
 .editor-meta > span:last-child > span { color: #afb4a7; }
 .editor-meta > span.over-limit { color: #ab483c; }
+.text-expansion { padding: 0 23px 13px; }
+.text-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.text-tools button { font-size: 11px; max-width: 100%; }
+.spoken-text-preview { margin-top: 10px; padding: 13px; border: 1px solid #e7eadf; border-radius: 7px; background: #fcfdfb; overflow-wrap: anywhere; }
+.spoken-text-preview h3 { font-size: 12px; font-weight: 600; }
+.spoken-text-content { margin: 8px 0; font-size: 14px; line-height: 1.7; white-space: pre-wrap; }
+.spoken-text-note { margin: 8px 0 12px; color: #758465; font-size: 11px; line-height: 1.7; }
 .subtle-dot { width: 4px; height: 4px; border-radius: 50%; background: #b4beaa; }
 .inspiration { padding: 17px 23px 21px; border-top: 1px solid #f0f2eb; }
 .inspiration > span { font-size: 8px; letter-spacing: 1.1px; color: #9ba28f; }

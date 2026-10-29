@@ -20,6 +20,8 @@ import torch
 
 from . import stt
 from .inference_settings import get_inference_settings
+from .eager import configure_eager_cache, read_eager_cache_enabled
+from .references import configure_prompt_audio
 from .mic import consume_complete
 from .paths import ASSETS, CACHE, MODELS, OUTPUT
 
@@ -47,16 +49,21 @@ def load_runtime():
     if not (MODEL_PATH / "model.safetensors").is_file():
         raise RuntimeError("Model weights are missing. Follow the README download instructions.")
     settings = get_inference_settings()
+    eager_cache = read_eager_cache_enabled()
     if settings.profile == "low-vram":
         from .low_vram import load_low_vram_runtime
 
         LOGGER.info("Loading experimental low-VRAM SOAR: NF4 language backbone, eager acoustic decoding.")
-        return load_low_vram_runtime(MODEL_PATH, precision=settings.precision)
+        runtime = load_low_vram_runtime(MODEL_PATH, precision=settings.precision)
+        configure_prompt_audio(runtime)
+        return configure_eager_cache(runtime, eager_cache)
     if settings.profile == "offload":
         from .offload import load_offloaded_runtime
 
         LOGGER.info("Loading experimental SOAR CPU offload with %s GPU-resident language blocks.", settings.gpu_layers)
-        return load_offloaded_runtime(MODEL_PATH, precision=settings.precision, gpu_layers=settings.gpu_layers)
+        runtime = load_offloaded_runtime(MODEL_PATH, precision=settings.precision, gpu_layers=settings.gpu_layers)
+        configure_prompt_audio(runtime)
+        return configure_eager_cache(runtime, eager_cache)
     optimize = settings.optimize
     if optimize:
         LOGGER.info(
@@ -78,7 +85,8 @@ def load_runtime():
             runtime.run_warmup()
     if runtime.device.type == "cpu":
         torch.set_num_threads(min(6, os.cpu_count() or 1))
-    return runtime
+    configure_prompt_audio(runtime)
+    return configure_eager_cache(runtime, eager_cache)
 
 
 def read_reference(path):

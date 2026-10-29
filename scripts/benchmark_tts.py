@@ -195,6 +195,11 @@ def run(args, parser):
             vocoder_merge_steps=args.vocoder_merge_steps,
             warmup_on_optimize=False,
         )
+    from t1000.eager import configure_eager_cache, read_eager_cache_enabled
+    from t1000.references import configure_prompt_audio
+
+    configure_prompt_audio(runtime)
+    configure_eager_cache(runtime, read_eager_cache_enabled())
     torch.cuda.synchronize(runtime.device)
     model_load_seconds = time.perf_counter() - started
     load_peak_cuda_allocated_bytes = torch.cuda.max_memory_allocated(runtime.device)

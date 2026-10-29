@@ -1,5 +1,28 @@
 # Changelog
 
+## 2026-10-29 — Conditioning reuse and reference/text accuracy safeguards
+
+- Add optional request-scoped reuse of eager Euler timestep conditioning via
+  `T1000_TTS_EAGER_CACHE=1`. It preserves the original solver and sampling
+  arithmetic, checks voice/timestep consistency, and defaults off.
+- Preserve quiet reference boundaries instead of silently applying the upstream
+  30 dB trimming threshold. Cache CPU prompt preprocessing by content, bounded
+  to eight entries/16 MiB; `T1000_REFERENCE_TRIM=1` restores upstream trimming.
+- Add explicit English text-expansion preview with Apply, Cancel and Undo.
+  Ambiguous formatted phone numbers require manual spelling. Reference
+  transcripts are never normalized.
+- Add API/browser request timing milestones and opt-in local-server startup
+  preload with `T1000_PRELOAD_MODELS=1`.
+
+Validation: 150 backend tests pass locally and on the RTX 3050 laptop, along
+with nine browser checks and both production builds. A two-run warm comparison
+measured 5.709 seconds without conditioning reuse versus 5.578 seconds with it
+(2.3% lower), with bit-identical audio. This small sample is not a statistical
+performance guarantee. Four sentences with complete reference audio retained
+every requested word in normalized ASR checks. Quiet-boundary tests reproduce
+the old trimming loss; preserving the reference can change pacing and duration.
+These checks do not establish general accuracy or subjective speaker quality.
+
 ## 2026-10-28 — RTX 3050 memory and generation optimization
 
 - Fuse the acoustic decoder's inference projections on CPU before CUDA

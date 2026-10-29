@@ -6,7 +6,9 @@ bounded PCM recorder remain the source of truth for audio and cancellation.
 
 import json
 import logging
+import os
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
 from . import tts as voice
+from .text import expand_english_text
 from .mic import RecorderService
 from .paths import CACHE, WEB
 
@@ -71,6 +74,10 @@ class GenerateRequest(Payload):
     transcript: str = Field(min_length=1, max_length=8000)
     steps: int = Field(default=10, strict=True, ge=4, le=32)
     seed: int = Field(default=42, strict=True, ge=0, le=4294967295)
+
+
+class NormalizeTextRequest(Payload):
+    text: str = Field(min_length=1, max_length=TEXT_LIMIT)
 
 
 def _register(path, transcript="", status=""):
@@ -133,6 +140,18 @@ def config():
         "example": example,
         "sample_url": "/api/audio/sample" if (voice.OUTPUT_DIR / "test-english.wav").is_file() else None,
     }
+
+
+@api.post("/api/text/normalize")
+async def normalize_text(payload: NormalizeTextRequest):
+    try:
+        normalized = await run_in_threadpool(expand_english_text, payload.text, max_length=TEXT_LIMIT)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        LOGGER.warning("English text expansion failed: %s", exc)
+        raise HTTPException(503, "Text expansion is unavailable. Keep or edit your original text.") from exc
+    return {"text": normalized}
 
 
 @api.get("/api/audio/{audio_id}")
@@ -269,9 +288,12 @@ def _next(source):
         return None
 
 
-def _event(update):
+def _event(update, *, started, timings):
     output, status, _, stop_button = update
-    event = {"status": status, "done": not stop_button.get("interactive", False)}
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
+    done = not stop_button.get("interactive", False)
+    event = {"status": status, "done": done, "elapsed_ms": elapsed_ms,
+             "timings": {**timings, **({"completion_ms": elapsed_ms} if done else {})}}
     if isinstance(output, str):
         output_path = Path(output).resolve()
         if not output_path.is_relative_to(voice.OUTPUT_DIR.resolve()) or not output_path.is_file():
@@ -282,16 +304,21 @@ def _event(update):
 
 @api.post("/api/generate")
 async def generate(payload: GenerateRequest):
+    # All server milestones share one monotonic origin. These describe API
+    # handling; first status is not the first PCM chunk or browser playback.
+    started = time.perf_counter()
     if not payload.text.strip() or not payload.transcript.strip():
         raise HTTPException(400, "Enter text to speak and the reference recording's exact words.")
     selected = _lookup(payload.reference_id)
     await run_in_threadpool(_validate_reference, selected.path)
+    timings = {"reference_validated_ms": round((time.perf_counter() - started) * 1000, 3)}
     if not generation_lock.acquire(blocking=False):
         raise HTTPException(409, "Speech generation is already running. Wait or press Stop.")
     source = voice.synthesize(payload.text, str(selected.path), payload.transcript, payload.steps, payload.seed)
     generation = _Generation(source)
     try:
         first = await run_in_threadpool(generation.next)
+        timings["first_status_ms"] = round((time.perf_counter() - started) * 1000, 3)
     except BaseException as exc:
         generation.close()
         if isinstance(exc, Exception):
@@ -302,11 +329,13 @@ async def generate(payload: GenerateRequest):
         try:
             update = first
             while update is not None:
-                yield _event(update)
+                yield _event(update, started=started, timings=timings)
                 update = await run_in_threadpool(generation.next)
         except Exception as exc:
             LOGGER.exception("Speech generation stream failed")
-            yield json.dumps({"status": f"Generation failed: {exc}", "error": str(exc), "done": True}) + "\n"
+            elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
+            yield json.dumps({"status": f"Generation failed: {exc}", "error": str(exc), "done": True,
+                              "elapsed_ms": elapsed_ms, "timings": {**timings, "completion_ms": elapsed_ms}}) + "\n"
         finally:
             with anyio.CancelScope(shield=True):
                 await run_in_threadpool(generation.close)
@@ -325,6 +354,16 @@ else:
 def main():
     import uvicorn
 
+    preload = os.environ.get("T1000_PRELOAD_MODELS", "0").strip()
+    if preload not in {"0", "1"}:
+        raise ValueError("T1000_PRELOAD_MODELS must be 0 or 1.")
+    if preload == "1":
+        LOGGER.info("Loading speech models before opening the interface.")
+        voice.load_runtime()
+        try:
+            voice.stt.preload_cpu_model()
+        except voice.stt.STTError as exc:
+            LOGGER.warning("Automatic transcription is unavailable: %s", exc)
     uvicorn.run(api, host="127.0.0.1", port=7860)
 
 
