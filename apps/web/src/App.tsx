@@ -67,9 +67,9 @@ function Help({ close }: { close: () => void }) {
     <ol>
       <li><strong>Choose a voice.</strong> Start with the included example, upload a clip, or record one clear English sentence.</li>
       <li><strong>Check the transcript.</strong> The reference words should match the recording exactly.</li>
-      <li><strong>Make it speak.</strong> Write a short line and generate. The first request also loads the local model.</li>
+      <li><strong>Make it speak.</strong> Write a sentence or a few paragraphs and generate. Paragraphs are read in order and saved as one WAV file.</li>
     </ol>
-    <p>CPU generation can take several minutes. Stop generation finishes the current audio step and saves any partial audio.</p>
+    <p>Longer passages take more time, especially on CPU. Stop generation finishes the current audio step and saves any partial audio.</p>
     <p>Audio and inference stay on this machine. No ElevenLabs account or API key is needed.</p>
     <a href="https://github.com/elevenlabs/ui" target="_blank" rel="noreferrer">Built with ElevenLabs UI <ArrowRight size={14} /></a>
   </dialog>
@@ -348,7 +348,7 @@ export default function App() {
           <div className="creation-column">
             <section className="panel editor-panel" aria-labelledby="text-heading">
               <div className="panel-heading"><h2 id="text-heading"><span className="step-number">01</span>What would you like to say?</h2><span className="small-label">English</span></div>
-              <div className="text-editor"><label className="sr-only" htmlFor="speech-text">Text to speak</label><textarea id="speech-text" ref={textInput} value={text} disabled={busy} placeholder="Every great voice starts with a few words…" onChange={event => changeText(event.target.value)} onKeyDown={event => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") { event.preventDefault(); void synthesize() } }} /><div className="editor-meta"><span><span className="subtle-dot" />Let your words do the talking.</span><span className={config && text.length > config.text_limit ? "over-limit" : ""}>{text.length}<span> / {config?.text_limit ?? "—"}</span></span></div></div>
+              <div className="text-editor"><label className="sr-only" htmlFor="speech-text">Text to speak</label><textarea id="speech-text" ref={textInput} value={text} disabled={busy} placeholder="Write a sentence or a few paragraphs…" onChange={event => changeText(event.target.value)} onKeyDown={event => { if ((event.metaKey || event.ctrlKey) && event.key === "Enter") { event.preventDefault(); void synthesize() } }} /><div className="editor-meta"><span><span className="subtle-dot" />Write a sentence or a few paragraphs.</span><span aria-label="Character count" className={config && text.length > config.text_limit ? "over-limit" : ""}>{text.length}<span> / {config?.text_limit ?? "—"} characters</span></span></div></div>
               <div className="text-expansion">
                 <div className="text-tools"><Button variant="ghost" size="sm" disabled={!config || busy || normalizing || !text.trim() || text.length > config.text_limit} onClick={() => void expandNumbers()}>{normalizing ? <><LoaderCircle size={13} className="spin" />Expanding…</> : "Expand numbers"}</Button>{originalText !== null && <Button variant="ghost" size="sm" disabled={busy || normalizing} onClick={() => { changeText(originalText); textInput.current?.focus() }}>Undo expansion</Button>}{normalizing && <Button variant="ghost" size="sm" onClick={cancelExpansion}>Cancel</Button>}</div>
                 {textPreview && <section className="spoken-text-preview" aria-labelledby="spoken-text-heading"><h3 id="spoken-text-heading">Spoken text preview</h3><p className="spoken-text-content">{textPreview.expanded}</p><p className="spoken-text-note">Review numbers, dates, phone numbers and abbreviations before applying. Edit the text if you want a different reading.</p><div className="text-tools"><Button variant="outline" size="sm" onClick={applyExpansion}>Apply</Button><Button variant="ghost" size="sm" onClick={cancelExpansion}>Cancel</Button></div></section>}

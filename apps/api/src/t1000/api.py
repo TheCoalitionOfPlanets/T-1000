@@ -160,6 +160,7 @@ def config():
         "resumable_generation": True,
         "reference_limit": voice.REFERENCE_LIMIT,
         "text_limit": TEXT_LIMIT,
+        "segment_text_limit": voice.SEGMENT_TEXT_LIMIT,
         "example": example,
         "sample_url": "/api/audio/sample" if (voice.OUTPUT_DIR / "test-english.wav").is_file() else None,
     }

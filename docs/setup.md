@@ -189,11 +189,20 @@ If ASR fails, its setup error is shown and complete audio remains available for
 manual transcription. A current browser with AudioWorklet and microphone
 permission is required, on localhost or HTTPS.
 
-Standard GPU text is limited to 500 characters; CPU text to 150 characters.
+The editor and API accept up to **5,000 characters**, including multiple
+paragraphs. The counter measures characters, not words. Long input is planned
+into sentence-aware parts that fit the existing model context: up to 150
+characters on CPU and low-memory GPU profiles, or 500 on standard CUDA. Parts
+run sequentially with the same full reference and transcript, then join in one
+WAV without trimming generated speech. Short input within the part limit keeps
+its original single-call behavior. Existing quiet samples at boundaries are
+retained; only a missing brief pause is padded at a sentence or paragraph break.
+
 References are limited to 10 seconds with CPU TTS and 30 seconds with standard
-CUDA TTS. Experimental low-memory profiles use 150 characters and 6-second
-references. Generation
-has a 600-second budget. **Stop generation** and the
+CUDA TTS. Experimental low-memory profiles keep 6-second references. Generation
+has a 600-second budget for one part or 1,800 seconds for multiple parts, and
+output audio is capped at 10 minutes. A model cap, error or cancellation stops
+the remaining parts and labels the saved result incomplete. **Stop generation** and the
 deadline request cancellation after the current audio step and preserve any
 partial output; they do not immediately interrupt a running CUDA operation.
 
@@ -238,7 +247,7 @@ explicitly marked partial rather than complete speech.
 | Completed generation jobs | Latest 16, retained for up to 15 minutes |
 | Completed recording finalization receipts | Latest 64, retained for up to 15 minutes |
 | Browser generation transport | Initial attempt plus at most 3 retries; 10-second header and 30-second progress deadlines |
-| Verified WAV transfer | At most 3 attempts; 32 MiB maximum |
+| Verified WAV transfer | At most 3 attempts; 64 MiB maximum (10-minute generated-audio cap) |
 
 Retention is bounded and expires on later requests or cleanup. These are in-tab
 retries against the running server, not durable recovery across a server restart.
@@ -281,10 +290,12 @@ resident checkpoint cannot fit on a 4 GiB GPU by merely disabling compilation.
 | `offload`, GPU layers `0` | Acoustic modules and token embeddings stay on CUDA; language blocks are stored in CPU RAM and loaded onto CUDA for each forward call. | Preserves unquantized weights and lowers resident VRAM, but repeated transfers generally increase latency. |
 | `offload`, GPU layers `14` | Keep half the bundled language model's 28 decoder blocks on CUDA and offload the rest. | Fewer transfers, more VRAM. This is not half of the complete TTS model, and may be too large for 4 GB. |
 
-Both low-memory modes disable compilation, cap the runtime at 128 total audio
-patches and a 512-position language context, and accept at most 150 text characters
-and 6-second references. Long utterances can hit the audio cap; listen for complete
-speech. Use the default CPU transcription backend so ASR does not compete for VRAM.
+Both low-memory modes disable full-model compilation, cap each inference part at
+128 total audio patches and a 512-position language context, and use at most 150
+text characters per part with 6-second references. Paragraph requests accept up
+to 5,000 characters through sequential parts. A part that hits the audio cap
+stops the request with an explicit incomplete result. Use the default CPU
+transcription backend so ASR does not compete for VRAM.
 The loaders fuse acoustic inference weights on CPU before placement, avoiding
 temporary duplicate weights on CUDA during the first decode.
 The full checkpoint is still loaded into CPU RAM initially: these profiles do not

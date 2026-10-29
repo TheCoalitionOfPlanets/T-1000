@@ -9,6 +9,7 @@ export interface Config {
   device: string
   reference_limit: number
   text_limit: number
+  segment_text_limit?: number
   example: Reference | null
   sample_url: string | null
   resumable_generation?: boolean
@@ -71,7 +72,7 @@ export interface GenerationRequestTimings {
 }
 
 const MAX_EVENT_BYTES = 64 * 1024
-const MAX_AUDIO_BYTES = 32 * 1024 * 1024
+const MAX_AUDIO_BYTES = 64 * 1024 * 1024
 const HEADER_TIMEOUT_MS = 10_000
 const PROGRESS_TIMEOUT_MS = 30_000
 

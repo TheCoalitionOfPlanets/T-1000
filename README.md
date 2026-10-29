@@ -345,8 +345,8 @@ Try the bundled voice and one short English sentence. Check that your own refere
 ## Limitations
 
 - This interface supports English inference; training and fine-tuning are not implemented.
-- CPU requests allow 150 text characters and references up to 10 seconds. Standard CUDA requests allow 500 characters and 30-second references; experimental low-memory profiles allow 150 characters and 6-second references. References must be at least one second; uploads are capped at 32 MB.
-- Generation has a 600-second budget. Cancellation waits for the current compute step.
+- Requests accept up to 5,000 text characters, including multiple paragraphs. Longer passages use sentence-aware parts of up to 150 characters on CPU and low-memory GPU profiles, or 500 on standard CUDA. Every part uses the same reference, and one WAV contains the complete result. References remain limited to 10 seconds on CPU, 30 seconds on standard CUDA and 6 seconds on low-memory profiles. References must be at least one second; uploads are capped at 32 MB.
+- Generation has a 600-second budget for one part or 1,800 seconds for multiple parts, with a maximum of 10 minutes of output audio. Cancellation finishes the current compute step and saves an explicitly incomplete result; it does not silently skip remaining text.
 - Real CUDA synthesis and CPU recognition pass on a 4 GB RTX 3050 Laptop GPU with
   the low-memory profile. See [the hardware record](docs/setup.md#rtx-3050-validation--2026-10-28)
   for measured latency; combined CUDA TTS/ASR and other GPUs still need testing.

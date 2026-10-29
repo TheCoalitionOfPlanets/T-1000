@@ -78,3 +78,27 @@ test("an expired job can be reset without losing the text or reference", async (
   await expect(page.getByLabel("Reference transcript")).toHaveValue(example.transcript)
   await expect(page.getByRole("button", { name: "Reconnect to generation" })).toHaveCount(0)
 })
+
+test("paragraphs longer than 150 characters are submitted unchanged as one verified generation", async ({ page }) => {
+  const paragraph = "The morning train arrived while the town was still waking up. Daniel watched the doors open and waved to his sister.\n\nThey walked toward the river together, talking about the letter she had received. Every detail mattered, and neither wanted to forget a word."
+  expect(paragraph.length).toBeGreaterThan(150)
+  await page.route("**/api/config", r => r.fulfill({ json: { ...config, text_limit: 5000, segment_text_limit: 150 } }))
+  await page.route("**/api/audio/**", r => r.fulfill({ contentType: "audio/wav", body: audio }))
+  const inputs: Record<string, unknown>[] = []
+  await page.route("**/api/generate", r => {
+    const input = r.request().postDataJSON(); inputs.push(input)
+    return r.fulfill({ contentType: "application/x-ndjson", body: JSON.stringify({ generation_id: input.generation_id, sequence: 3,
+      status: "Generated both paragraphs.", done: true, audio_url: "/api/audio/generated", audio: metadata, partial: false }) + "\n" })
+  })
+  await page.goto("/")
+  await page.getByLabel("Text to speak").fill(paragraph)
+  await expect(page.getByLabel("Character count")).toHaveText(`${paragraph.length} / 5000 characters`)
+  await expect(page.getByRole("button", { name: "Generate speech", exact: true })).toBeEnabled()
+  await page.getByRole("button", { name: "Generate speech", exact: true }).click()
+  await expect(page.getByRole("link", { name: "Download speech as WAV" })).toHaveAttribute("href", /^blob:/)
+  expect(inputs).toHaveLength(1)
+  expect(inputs[0].text).toBe(paragraph)
+  expect(inputs[0].generation_id).toEqual(expect.any(String))
+  await expect(page.getByLabel("Text to speak")).toHaveValue(paragraph)
+  await expect(page.getByRole("alert")).toHaveCount(0)
+})

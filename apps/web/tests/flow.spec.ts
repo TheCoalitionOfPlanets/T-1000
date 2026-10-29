@@ -241,7 +241,7 @@ for (const mode of ["hash", "extra-bytes", "wrong-wav-frames", "oversized-manife
       const audio = { ...s.audio }
       if (mode === "hash") audio.sha256 = "f".repeat(64)
       if (mode === "wrong-wav-frames") { audio.total_samples = 7; audio.duration_seconds = 7 / audio.sample_rate }
-      if (mode === "oversized-manifest") audio.byte_length = 32 * 1024 * 1024 + 1
+      if (mode === "oversized-manifest") audio.byte_length = 64 * 1024 * 1024 + 1
       window.fetch = async () => { s.requests.push({}); return s.response([bytes]) }
       try { await s.api.downloadVerifiedAudio("/api/audio/result", audio, new AbortController().signal); return { error: "", calls: s.requests.length } }
       catch (e) { return { error: String((e as Error).message), calls: s.requests.length } }
