@@ -3,7 +3,7 @@ import { ArrowDownToLine, ArrowRight, AudioLines, Check, CircleHelp, Cpu, Headph
 import { AudioPlayerButton, AudioPlayerDuration, AudioPlayerProgress, AudioPlayerProvider, AudioPlayerSpeed, AudioPlayerTime, useAudioPlayer } from "@/components/elevenlabs/audio-player"
 import { LiveWaveform } from "@/components/elevenlabs/live-waveform"
 import { Button } from "@/components/ui/button"
-import { generate, post, request, type Config, type Reference } from "@/lib/api"
+import { downloadVerifiedAudio, generate, post, request, type Config, type Reference, type GenerationUpdate } from "@/lib/api"
 import { VoiceRecorder } from "@/lib/recorder"
 
 const phrases = [
@@ -93,6 +93,11 @@ export default function App() {
   const [stream, setStream] = useState<MediaStream | null>(null)
   const [recordedSeconds, setRecordedSeconds] = useState(0)
   const [preview, setPreview] = useState("")
+  const [recoveredRecording, setRecoveredRecording] = useState<File | null>(null)
+  const [recoveryUrl, setRecoveryUrl] = useState<string | null>(null)
+  const recoveryFile = useRef<File | null>(null)
+  const [canResume, setCanResume] = useState(false)
+  const pendingGeneration = useRef<{ text: string; reference_id: string; transcript: string; steps: number; seed: number; generation_id?: string } | null>(null)
   const [steps, setSteps] = useState(10)
   const [seed, setSeed] = useState("42")
   const [busy, setBusy] = useState(false)
@@ -122,12 +127,25 @@ export default function App() {
 
   useEffect(() => {
     void connect()
-    const cancel = () => { void recorder.current?.cancel(); generationController.current?.abort(); referenceController.current?.abort(); normalizationController.current?.abort() }
+    const cancel = () => {
+      void recorder.current?.cancel()
+      const generationId = pendingGeneration.current?.generation_id
+      if (generationId) void fetch("/api/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ generation_id: generationId }), keepalive: true }).catch(() => {})
+      generationController.current?.abort(); referenceController.current?.abort(); normalizationController.current?.abort()
+    }
     window.addEventListener("pagehide", cancel)
     return () => { cancel(); window.removeEventListener("pagehide", cancel) }
   }, [])
 
-  const referenceLocked = busy || referenceBusy || recording
+  useEffect(() => {
+    if (!recoveredRecording) { setRecoveryUrl(null); return }
+    const url = URL.createObjectURL(recoveredRecording)
+    setRecoveryUrl(url)
+    return () => URL.revokeObjectURL(url)
+  }, [recoveredRecording])
+  useEffect(() => () => { if (result?.startsWith("blob:")) URL.revokeObjectURL(result) }, [result])
+
+  const referenceLocked = busy || referenceBusy || recording || canResume
   const validSeed = /^\d+$/.test(seed) && Number(seed) <= 4294967295
   const canGenerate = !!config && !!reference && !!text.trim() && !!transcript.trim() && text.length <= config.text_limit && validSeed && !referenceLocked && !normalizing && !textPreview
 
@@ -173,6 +191,7 @@ export default function App() {
   }
 
   function useExample() {
+    recoveryFile.current = null; setRecoveredRecording(null)
     if (!config?.example) return
     setReference(config.example)
     setReferenceName("Example voice")
@@ -183,6 +202,7 @@ export default function App() {
 
   async function upload(file?: File) {
     if (!file || referenceLocked) return
+    if (file !== recoveryFile.current) { recoveryFile.current = null; setRecoveredRecording(null) }
     setReference(null)
     setTranscript("")
     setReferenceError("")
@@ -198,11 +218,13 @@ export default function App() {
       setReferenceName(file.name)
       setTranscript(selected.transcript)
       setReferenceStatus(selected.status)
+      recoveryFile.current = null; setRecoveredRecording(null)
     } catch (error) { setReferenceError(error instanceof Error ? error.message : "This audio could not be uploaded."); setReferenceStatus("Upload another recording or use the example voice.") }
     finally { setReferenceBusy(false); if (fileInput.current) fileInput.current.value = "" }
   }
 
   function record() {
+    recoveryFile.current = null; setRecoveredRecording(null)
     setReference(null)
     setTranscript("")
     setPreview("")
@@ -215,7 +237,8 @@ export default function App() {
       onProgress: (seconds, words) => { setRecordedSeconds(seconds); setPreview(words) },
       onStatus: setReferenceStatus,
       onComplete: selected => { setReference(selected); setReferenceName("My recorded voice"); setTranscript(selected.transcript); setReferenceStatus(selected.status); setRecording(false); setReferenceBusy(false); recorder.current = null },
-      onError: message => { setReferenceError(message); setReferenceStatus("Record again, upload audio, or use the example voice."); setRecording(false); setReferenceBusy(false); recorder.current = null },
+      onRecovery: (file, message) => { recoveryFile.current = file; setRecoveredRecording(file); setReferenceStatus(message) },
+      onError: message => { setReferenceError(message); setReferenceStatus(recoveryFile.current ? "Your complete recording is held in this tab. Download it before closing, or retry the upload." : "Record again, upload audio, or use the example voice."); setRecording(false); setReferenceBusy(false); recorder.current = null },
     })
     void recorder.current.start()
   }
@@ -233,30 +256,76 @@ export default function App() {
     setReferenceStatus("Recording discarded. Record again or choose the example voice.")
   }
 
-  async function synthesize() {
-    if (!canGenerate || !reference) return
+  async function runGeneration(payload: NonNullable<typeof pendingGeneration.current>) {
+    if (generationController.current) return
     setBusy(true)
     setStopping(false)
+    setCanResume(false)
     setGenerationError("")
     setStatus("Preparing your reference recording…")
     const controller = new AbortController()
     generationController.current = controller
-    let hasAudio = false
+    let terminal: GenerationUpdate | undefined
     try {
-      await generate({ text, reference_id: reference.id, transcript, steps, seed: Number(seed) }, controller.signal, update => {
+      await generate(payload, controller.signal, update => {
         setStatus(update.status)
-        if (update.audio_url) { hasAudio = true; setResult(update.audio_url); setResultLabel("Your generated speech") }
+        if (update.done) terminal = update
         if (update.error) setGenerationError(update.error)
-        if (update.done && !hasAudio) setGenerationError(update.error || update.status)
       })
-    } catch (error) { if (!controller.signal.aborted) { setGenerationError(error instanceof Error ? error.message : "Generation failed."); setStatus("Generation ended. Review the message below and try again.") } }
-    finally { setBusy(false); setStopping(false); generationController.current = null }
+      if (terminal?.audio_url) {
+        let url = terminal.audio_url
+        if (terminal.audio) {
+          setStatus("Checking the received audio…")
+          const blob = await downloadVerifiedAudio(url, terminal.audio, controller.signal)
+          if (controller.signal.aborted) return
+          url = URL.createObjectURL(blob)
+        }
+        setResult(url)
+        setResultLabel(terminal.partial ? "Your partial speech" : "Your generated speech")
+        setStatus(terminal.status)
+      } else if (terminal) {
+        setGenerationError(terminal.error || terminal.status)
+      }
+      pendingGeneration.current = null
+      setCanResume(false)
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        setGenerationError(error instanceof Error ? error.message : "Generation connection was interrupted.")
+        setStatus(payload.generation_id ? "Reconnect to the same generation to recover its audio." : "Generation ended. Review the message below and try again.")
+        setCanResume(!!payload.generation_id)
+      }
+    } finally {
+      setBusy(false); setStopping(false); generationController.current = null
+    }
+  }
+
+  async function synthesize() {
+    if (!canGenerate || !reference || generationController.current) return
+    const payload = { text, reference_id: reference.id, transcript, steps, seed: Number(seed),
+      ...(config?.resumable_generation ? { generation_id: crypto.randomUUID() } : {}) }
+    pendingGeneration.current = payload
+    await runGeneration(payload)
+  }
+
+  function resetGeneration() {
+    const generationId = pendingGeneration.current?.generation_id
+    pendingGeneration.current = null
+    setCanResume(false); setStopping(false); setGenerationError("")
+    setStatus("Your text and reference are ready. Generate again when the connection is available.")
+    if (generationId) {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 4000)
+      void post("/api/stop", { generation_id: generationId }, controller.signal).catch(() => {}).finally(() => clearTimeout(timer))
+    }
   }
 
   async function stop() {
     setStopping(true)
-    try { await post("/api/stop", {}); setStatus("Stop requested. Finishing the current audio step…") }
-    catch (error) { setStopping(false); setGenerationError(error instanceof Error ? error.message : "Could not stop generation. Try again.") }
+    try {
+      const generationId = pendingGeneration.current?.generation_id
+      await post("/api/stop", generationId ? { generation_id: generationId } : {})
+      setStatus("Stop requested. Finishing the current audio step…")
+    } catch (error) { setStopping(false); setGenerationError(error instanceof Error ? error.message : "Could not stop generation. Try again.") }
   }
 
   return <div className="studio-shell">
@@ -293,6 +362,7 @@ export default function App() {
               <div className="panel-heading"><h2 id="output-heading"><Headphones size={17} />The listening room</h2>{result && <a className="download-link" href={result} download="t-1000-speech.wav" aria-label="Download speech as WAV"><ArrowDownToLine size={15} />Download WAV</a>}</div>
               <div className="output-body">{busy && <div className="generating-state"><LoaderCircle size={19} className="spin" /><div><strong>{stopping ? "Finishing the current step" : "Bringing your words to life"}</strong><span>{config?.device === "CPU" ? "CPU synthesis can take a few minutes. You can stop at any time." : "Your local model is creating your audio."}</span></div></div>}
                 {result ? <AudioPlayerProvider key={result}><div className="audio-result"><div className="audio-result-label"><span><span className="status-dot" />{resultLabel}</span><span>WAV · 48 kHz</span></div><AudioWaveform url={result} /><Player url={result} /></div></AudioPlayerProvider> : !busy && <div className="output-empty"><div className="empty-audio-lines"><AudioLines size={30} strokeWidth={1.3} /></div><strong>Something worth listening to.</strong><p>Your generated audio will be right here.</p></div>}
+                {canResume && <div className="text-tools"><Button variant="outline" size="sm" onClick={() => { if (pendingGeneration.current) void runGeneration(pendingGeneration.current) }}>Reconnect to generation</Button><Button variant="ghost" size="sm" disabled={stopping} onClick={() => void stop()}>{stopping ? "Stop requested" : "Stop generation"}</Button><Button variant="ghost" size="sm" onClick={() => void resetGeneration()}>Stop and reset</Button></div>}
                 <div className={`result-status ${generationError ? "has-error" : ""}`} role="status" aria-live="polite">{busy ? <span className="activity-dot" /> : <Check size={13} />}<span>{status}</span></div>
                 {generationError && <p className="field-error" role="alert">{generationError}</p>}
               </div>
@@ -311,6 +381,7 @@ export default function App() {
                 <input ref={fileInput} type="file" accept="audio/*,.wav,.flac,.mp3,.ogg,.m4a" className="sr-only" aria-label="Upload reference audio" onChange={event => void upload(event.target.files?.[0])} disabled={referenceLocked} />
                 <div className="reference-note" role="status" aria-live="polite">{referenceBusy && <LoaderCircle size={12} className="spin" />}<span>{referenceStatus}</span></div>
                 {referenceError && <p className="field-error" role="alert">{referenceError}</p>}
+                {recoveryUrl && recoveredRecording && <div className="text-tools"><a className="download-link" href={recoveryUrl} download="my-voice-recording.wav">Download recording</a><Button variant="outline" size="sm" disabled={referenceBusy} onClick={() => void upload(recoveredRecording)}>Retry recording upload</Button></div>}
                 <div className="transcript-heading"><label htmlFor="reference-transcript">Reference transcript</label><span>{recording ? "LIVE" : "EDITABLE"}</span></div><textarea id="reference-transcript" className="transcript-input" rows={3} value={transcript} disabled={referenceLocked || !reference} placeholder="The exact words spoken in your reference…" onChange={event => setTranscript(event.target.value)} /><p className="transcript-help">For the best match, these words should follow the recording exactly.</p>
                 <button className="restore-example" disabled={!config?.example || referenceLocked} onClick={useExample}><RotateCcw size={12} />Use example voice</button>
               </div>

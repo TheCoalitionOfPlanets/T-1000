@@ -226,6 +226,11 @@ def transcribe_file(path, max_seconds=180.0):
         session.previews_enabled = False  # Uploaded files need only a final pass.
     try:
         with sf.SoundFile(str(path)) as recording:
+            if recording.frames > int(float(max_seconds) * recording.samplerate):
+                raise STTError(
+                    f"The reference recording exceeds the {float(max_seconds):g}-second limit. "
+                    "Use a complete shorter recording; a truncated transcript was not produced."
+                )
             while not session.limit_reached:
                 samples = recording.read(recording.samplerate, dtype="float32", always_2d=True)
                 if not samples.size:

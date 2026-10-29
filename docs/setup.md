@@ -211,6 +211,49 @@ For frontend editing, keep `.venv/bin/python -m t1000` running and use
 `.venv/bin/python -m t1000.ui` and preloads the model at startup. Stop `t1000.api`
 before using it because both entry points bind port 7860.
 
+## Recording, reconnects and playback
+
+The React recorder collects PCM in 20 ms worklet batches and coalesces it into
+serialized network feeds every 500 ms when the previous feed has finished. Ordered
+chunk and cumulative sample acknowledgements detect duplicate, missing or changed data.
+Finishing waits for the worklet's final partial batch, then reconciles the complete
+captured PCM with the server. A failed save keeps the complete recording in the
+open tab for download or retry. Live STT is a preview; review the final reference
+transcript before generating speech. CPU STT can run while audio is captured and
+transferred, while GPU synthesis remains serialized.
+
+Generation uses one immutable request ID and payload. A broken progress connection
+reconnects to that job with its last accepted sequence; it does not start a second
+inference. **Stop generation** targets that request. The worker writes ordered
+PCM16 samples to a temporary WAV and publishes the closed file atomically with a
+sample count and SHA-256 manifest. The browser resumes interrupted WAV transfers
+with HTTP Range, verifies bytes, checksum and WAV frames, then shares one buffered
+Blob between playback and the waveform. Complete buffering avoids playback gaps
+when synthesis runs slower than real time. Cancelled, failed or capped output is
+explicitly marked partial rather than complete speech.
+
+| Recovery bound | Current value |
+| --- | --- |
+| No progress subscribers | Cancel after a 60-second reconnect grace period; preserve produced audio as partial |
+| Completed generation jobs | Latest 16, retained for up to 15 minutes |
+| Completed recording finalization receipts | Latest 64, retained for up to 15 minutes |
+| Browser generation transport | Initial attempt plus at most 3 retries; 10-second header and 30-second progress deadlines |
+| Verified WAV transfer | At most 3 attempts; 32 MiB maximum |
+
+Retention is bounded and expires on later requests or cleanup. These are in-tab
+retries against the running server, not durable recovery across a server restart.
+The interface offers **Reconnect to generation**, or **Stop and reset** to retain
+the reference and text while clearing a failed request. Download a recovered
+recording before closing its tab. WAV publication is atomic, but this is not a
+power-loss durability guarantee.
+
+The full reference and whole synthesis utterance remain intact. Transport batches
+do not split text into independent TTS requests or alter the model, sampling steps,
+voice conditioning or numerical precision. These changes protect transfer and
+continuity; they do not establish better transcription, pronunciation or speaker
+similarity. The [lossless-flow validation report](../data/output/3050-lossless-flow/RESULTS.md)
+records the checks and their scope.
+
 ## GPU inference performance
 
 The `auto` profile selects experimental NF4 inference on CUDA GPUs with 6 GiB or

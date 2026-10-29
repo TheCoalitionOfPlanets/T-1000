@@ -5,11 +5,15 @@ bounded PCM recorder remain the source of truth for audio and cancellation.
 """
 
 import json
+import re
+import asyncio
+import hashlib
 import logging
 import os
 import threading
 import time
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -25,6 +29,7 @@ from starlette.concurrency import run_in_threadpool
 from . import tts as voice
 from .text import expand_english_text
 from .mic import RecorderService
+from .jobs import GenerationJobs, JobBusy, JobConflict, JobNotFound
 from .paths import CACHE, WEB
 
 
@@ -39,6 +44,11 @@ recorder = RecorderService(voice.REFERENCE_LIMIT)
 generation_lock = threading.Lock()
 audio_lock = threading.Lock()
 audio_files = OrderedDict()
+generation_jobs = GenerationJobs(shared_lock=generation_lock, disconnect_grace=60)
+finished_references = OrderedDict()
+finish_locks = {}
+FINISH_CACHE_LIMIT = 64
+FINISH_CACHE_TTL = 900
 
 
 @dataclass(frozen=True)
@@ -68,7 +78,13 @@ class RecordingFeed(RecordingPCM):
     sequence: int = Field(strict=True, ge=0)
 
 
+class StopRequest(Payload):
+    generation_id: str | None = Field(default=None, min_length=16, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+
+
 class GenerateRequest(Payload):
+    generation_id: str | None = Field(default=None, min_length=16, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    after_sequence: int = Field(default=0, strict=True, ge=0)
     text: str = Field(min_length=1, max_length=TEXT_LIMIT)
     reference_id: str = Field(min_length=1, max_length=64)
     transcript: str = Field(min_length=1, max_length=8000)
@@ -81,7 +97,9 @@ class NormalizeTextRequest(Payload):
 
 
 def _register(path, transcript="", status=""):
-    audio_id = uuid4().hex
+    match = re.fullmatch(r"speech-([a-f0-9]{32})\.wav", Path(path).name)
+    generated = not transcript and not status and match and Path(path).resolve().is_relative_to(voice.OUTPUT_DIR.resolve())
+    audio_id = f"g-{match.group(1)}" if generated else uuid4().hex
     with audio_lock:
         audio_files[audio_id] = AudioFile(Path(path), transcript, status)
         while len(audio_files) > MAX_AUDIO_ENTRIES:
@@ -96,6 +114,10 @@ def _lookup(audio_id):
         return AudioFile(voice.OUTPUT_DIR / "test-english.wav")
     with audio_lock:
         audio = audio_files.get(audio_id)
+    if audio is None and re.fullmatch(r"g-[a-f0-9]{32}", audio_id):
+        candidate = voice.OUTPUT_DIR / f"speech-{audio_id[2:]}.wav"
+        if candidate.resolve().is_relative_to(voice.OUTPUT_DIR.resolve()) and candidate.is_file():
+            audio = AudioFile(candidate)
     if audio is None or not audio.path.is_file():
         raise HTTPException(404, "This audio is unavailable. Select or record the voice again.")
     return audio
@@ -135,6 +157,7 @@ def config():
         example = {"id": "example", "url": "/api/audio/example", "transcript": voice.EXAMPLE_TRANSCRIPT, "status": "Example voice ready."}
     return {
         "device": voice.DEVICE,
+        "resumable_generation": True,
         "reference_limit": voice.REFERENCE_LIMIT,
         "text_limit": TEXT_LIMIT,
         "example": example,
@@ -209,32 +232,115 @@ async def recording_feed(payload: RecordingFeed):
     return await _recording_action(recorder.feed, payload)
 
 
+@dataclass
+class _RecordingLease:
+    lock: asyncio.Lock
+    users: int = 0
+
+
+def _forget_recording_lease(token):
+    lease = finish_locks.get(token)
+    if lease is not None and lease.users == 0 and token not in finished_references:
+        finish_locks.pop(token, None)
+
+
+def _prune_finished_references():
+    now = time.monotonic()
+    for token, cached in list(finished_references.items()):
+        if now - cached[0] > FINISH_CACHE_TTL:
+            finished_references.pop(token, None)
+            _forget_recording_lease(token)
+    while len(finished_references) > FINISH_CACHE_LIMIT:
+        token, _ = finished_references.popitem(last=False)
+        _forget_recording_lease(token)
+
+
+@asynccontextmanager
+async def _recording_lease(token):
+    # Count both the holder and every waiter BEFORE the first await. A released
+    # asyncio.Lock can be unlocked while a waiter is waking; locked() alone
+    # cannot decide whether this token's serialization object is still in use.
+    lease = finish_locks.get(token)
+    if lease is None:
+        lease = _RecordingLease(asyncio.Lock())
+        finish_locks[token] = lease
+    lease.users += 1
+    try:
+        async with lease.lock:
+            yield
+    finally:
+        lease.users -= 1
+        if (lease.users == 0 and token not in finished_references
+                and finish_locks.get(token) is lease):
+            finish_locks.pop(token, None)
+
+
 @api.post("/api/recordings/finish")
 async def recording_finish(payload: RecordingPCM):
-    result = await _recording_action(recorder.finish, payload)
-    if result.get("cancelled"):
-        return result
-    try:
-        path, transcript, status = await run_in_threadpool(recorder.consume, payload.token)
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    try:
-        await run_in_threadpool(_validate_reference, path)
-    except BaseException:
-        Path(path).unlink(missing_ok=True)
-        raise
-    return _register(path, transcript, status)
+    # A successful HTTP response may be lost. Serialize token completion and
+    # retain the SAME published reference for an identical full-PCM retry.
+    _prune_finished_references()
+    digest = hashlib.sha256(payload.pcm.encode()).hexdigest()
+    async with _recording_lease(payload.token):
+        with anyio.CancelScope(shield=True):
+            cached = finished_references.get(payload.token)
+            if cached is not None:
+                _, original_digest, published, path = cached
+                if original_digest != digest:
+                    raise HTTPException(400, "The completed recording cannot be changed on retry.")
+                if not Path(path).is_file():
+                    raise HTTPException(410, "The saved recording is unavailable. Upload your local copy.")
+                with audio_lock:
+                    audio_files[published["id"]] = AudioFile(Path(path), published["transcript"], published["status"])
+                    while len(audio_files) > MAX_AUDIO_ENTRIES:
+                        audio_files.popitem(last=False)
+                return published
+            result = await _recording_action(recorder.finish, payload)
+            if result.get("cancelled"):
+                return result
+            try:
+                path, transcript, status = await run_in_threadpool(recorder.consume, payload.token, retain=True)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            try:
+                await run_in_threadpool(_validate_reference, path)
+            except Exception:
+                await _recording_action(recorder.cancel, RecordingToken(token=payload.token))
+                Path(path).unlink(missing_ok=True)
+                raise
+            published = _register(path, transcript, status)
+            finished_references[payload.token] = (time.monotonic(), digest, published, path)
+            _prune_finished_references()
+            return published
 
 
 @api.post("/api/recordings/cancel")
 async def recording_cancel(payload: RecordingToken):
-    return await _recording_action(recorder.cancel, payload)
+    async with _recording_lease(payload.token):
+        finished_references.pop(payload.token, None)
+        result = await _recording_action(recorder.cancel, payload)
+    return result
 
 
 @api.post("/api/stop")
-def stop():
-    voice.stop_generation()
+def stop(payload: StopRequest | None = None):
+    if payload and payload.generation_id:
+        try:
+            generation_jobs.stop(payload.generation_id)
+        except JobNotFound as exc:
+            raise HTTPException(404, "This generation is unavailable.") from exc
+    else:
+        voice.stop_generation()
     return {"status": "Stop requested; finishing the current audio step."}
+
+
+@api.get("/api/generations/{generation_id}")
+def generation_state(generation_id: str):
+    try:
+        job = generation_jobs.get(generation_id)
+    except JobNotFound as exc:
+        raise HTTPException(404, "This generation is unavailable.") from exc
+    return job.read(cursor=0, timeout=0) or {"generation_id": generation_id, "sequence": 0, "done": False, "status": "Preparing generation…"}
 
 
 class _Generation:
@@ -294,12 +400,60 @@ def _event(update, *, started, timings):
     done = not stop_button.get("interactive", False)
     event = {"status": status, "done": done, "elapsed_ms": elapsed_ms,
              "timings": {**timings, **({"completion_ms": elapsed_ms} if done else {})}}
+    if done and status.startswith("Generation failed"):
+        event["error"] = status
+    if done and status.startswith("Stopped"):
+        event["cancelled"] = True
     if isinstance(output, str):
         output_path = Path(output).resolve()
         if not output_path.is_relative_to(voice.OUTPUT_DIR.resolve()) or not output_path.is_file():
             raise RuntimeError("Generated audio is unavailable.")
         event["audio_url"] = _register(output_path)["url"]
+        metadata = getattr(output, "metadata", None)
+        if metadata is not None:
+            event["audio"] = metadata
+            event["partial"] = not metadata["complete"]
     return json.dumps(event) + "\n"
+
+
+class _JobResponse(StreamingResponse):
+    def __init__(self, content, job, subscription):
+        super().__init__(content, media_type="application/x-ndjson", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+        self.job, self.subscription = job, subscription
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with anyio.CancelScope(shield=True):
+                try:
+                    await self.body_iterator.aclose()
+                finally:
+                    self.job.unsubscribe(self.subscription)
+
+
+def _job_response(job, after_sequence):
+    try:
+        subscription = job.subscribe()
+    except JobBusy as exc:
+        raise HTTPException(429, str(exc)) from exc
+    async def events():
+        cursor = after_sequence
+        while True:
+            event = await run_in_threadpool(job.read, cursor=cursor, timeout=0.5)
+            if event is not None:
+                cursor = event["sequence"]
+                yield json.dumps(event) + "\n"
+                if event.get("done"):
+                    break
+            elif job.done.is_set():
+                # A terminal snapshot remains retrievable even if a client
+                # reconnects after seeing its sequence but losing the response.
+                terminal = job.read(cursor=0, timeout=0)
+                if terminal is not None:
+                    yield json.dumps(terminal) + "\n"
+                break
+    return _JobResponse(events(), job, subscription)
 
 
 @api.post("/api/generate")
@@ -309,9 +463,35 @@ async def generate(payload: GenerateRequest):
     started = time.perf_counter()
     if not payload.text.strip() or not payload.transcript.strip():
         raise HTTPException(400, "Enter text to speak and the reference recording's exact words.")
+    if payload.generation_id:
+        fingerprint = hashlib.sha256(json.dumps(payload.model_dump(exclude={"generation_id", "after_sequence"}), sort_keys=True).encode()).hexdigest()
+        try:
+            existing = generation_jobs.get(payload.generation_id)
+        except JobNotFound:
+            if payload.after_sequence:
+                raise HTTPException(410, "This generation expired. Start a new generation explicitly.")
+            existing = None
+        if existing is not None:
+            if existing.payload_digest != fingerprint:
+                raise HTTPException(409, "A generation ID cannot be reused with different inputs.")
+            return _job_response(existing, payload.after_sequence)
+    elif payload.after_sequence:
+        raise HTTPException(400, "Resuming requires a generation ID.")
     selected = _lookup(payload.reference_id)
     await run_in_threadpool(_validate_reference, selected.path)
     timings = {"reference_validated_ms": round((time.perf_counter() - started) * 1000, 3)}
+    if payload.generation_id:
+        def serialize(update):
+            timings.setdefault("first_status_ms", round((time.perf_counter() - started) * 1000, 3))
+            return json.loads(_event(update, started=started, timings=timings))
+        try:
+            job = generation_jobs.submit(payload.generation_id, fingerprint,
+                lambda cancel: voice.synthesize(payload.text, str(selected.path), payload.transcript, payload.steps, payload.seed, cancel_event=cancel), serialize)
+        except JobBusy as exc:
+            raise HTTPException(409, "Speech generation is already running. Wait or press Stop.") from exc
+        except JobConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return _job_response(job, payload.after_sequence)
     if not generation_lock.acquire(blocking=False):
         raise HTTPException(409, "Speech generation is already running. Wait or press Stop.")
     source = voice.synthesize(payload.text, str(selected.path), payload.transcript, payload.steps, payload.seed)
