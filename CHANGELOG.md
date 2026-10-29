@@ -1,5 +1,63 @@
 # Changelog
 
+## 2026-10-29 — Paragraph generation
+
+- Raise the full request limit to 5,000 characters and label the editor counter
+  explicitly as characters. Plan longer text into sentence-aware parts within
+  the existing 150-character CPU/low-memory or 500-character standard CUDA cap.
+- Use the same full reference and transcript for every part, preserving all
+  input words and generated samples in one WAV. Add only missing quiet pauses
+  at joins; require every part to reach EOS before declaring completion.
+- Show part progress and preserve incomplete output on cancellation, inference
+  failure or a model cap. Allow 30 minutes for multi-part requests and cap output
+  at 10 minutes; expand verified WAV transfers to 64 MiB.
+
+Validation: 255 backend tests pass locally and on the RTX 3050, alongside 53
+browser checks and the production build. A real 290-character, two-paragraph
+request completed three parts and produced 15.09 seconds of speech in 41.76
+seconds. CPU ASR matched all 52 requested words after case and punctuation
+normalization. The short seeded regression WAV remains byte-identical to the
+previous deployment. These checks do not establish subjective naturalness or
+cloning similarity.
+
+## 2026-10-29 — Recording integrity and recoverable generation
+
+- Batch microphone capture in 20 ms worklet chunks with ordered offsets, sample
+  acknowledgements and final-tail flushing. Reconcile complete captured PCM on
+  finish, retry immutable payloads and retain a local recovery WAV on save failure.
+- Preserve the same completed reference across lost finish responses. Serialize
+  concurrent finish/cancel operations and retry full-file ASR when previews fail.
+- Move PCM ownership into a worker that writes an incremental, atomically
+  published WAV with sample count, completion reason and SHA-256 metadata.
+- Add bounded generation jobs with same-ID reconnects, progress cursors and
+  request-scoped Stop. Resume WAV downloads with HTTP Range and verify the whole
+  file before sharing one buffered Blob between playback and waveform rendering.
+
+Validation: 233 backend tests pass locally and on the RTX 3050; 52 browser checks,
+the production build and 16 live API/browser stages pass. The actual worklet
+reference retained all 68,864 captured samples, including 8,064 after the last
+feed acknowledgement. Reconnect, Range recovery, stale Stop isolation and explicit
+partial cancellation pass. Two seeded before/after WAVs are byte-identical. This
+change improves transfer reliability without establishing a new compute speedup.
+
+## 2026-10-29 — Vocoder compilation and comparison experiments
+
+- Add opt-in FP32 vocoder-only compilation through
+  `T1000_TTS_COMPILE_VOCODER=1`, with bounded startup warmup and CUDA graphs
+  disabled. Retain the existing SOAR sampling and four-patch buffering.
+- Add reproducible SOAR/MF2 and isolated-vocoder comparison scripts with timing,
+  memory, waveform and ASR scoring. Keep native LSTM, rotary reuse, reduced
+  decoder precision and eight-patch buffering as disabled experimental variants.
+
+Validation: eight unique English cases with two timed repeats per configuration
+gave 16 complete requests each. The compiled FP32 candidate achieved a 1.099×
+median paired speed ratio, or 9.0% lower matched generation latency; aggregate
+median generation times were 11.062 seconds before and 9.983 seconds after.
+Both unique eight-case sets had zero ASR word errors out of 80 words. The
+compiled outputs have small waveform differences, so these measurements do not
+establish audio identity, subjective quality or performance beyond the tested
+RTX 3050 inputs.
+
 ## 2026-10-29 — Conditioning reuse and reference/text accuracy safeguards
 
 - Add optional request-scoped reuse of eager Euler timestep conditioning via
