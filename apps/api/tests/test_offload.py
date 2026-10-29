@@ -155,6 +155,8 @@ class OffloadLoadingTests(unittest.TestCase):
 
         def create_runtime(model, path, **settings):
             self.assertFalse(torch.is_inference_mode_enabled())
+            fuse.assert_called_once_with(model.core)
+            self.assertEqual(events, ["fuse"])
             model.core.to(dtype=torch.bfloat16)
             model.to("cuda").eval()
             return SimpleNamespace(model=model, path=path, settings=settings)
@@ -162,10 +164,20 @@ class OffloadLoadingTests(unittest.TestCase):
         load_model = Mock(side_effect=create_model)
         runtime_factory = Mock(side_effect=create_runtime)
         offload = Mock()
+
+        def fuse_on_cpu(core):
+            self.assertFalse(torch.is_inference_mode_enabled())
+            self.assertTrue(all(p.device.type == "cpu" for p in core.parameters()))
+            events.append("fuse")
+
+        fuse = Mock(side_effect=fuse_on_cpu)
         modules = {
             "accelerate": SimpleNamespace(cpu_offload=offload),
             "dots_tts.models.dots_tts.model": SimpleNamespace(
                 DotsTtsModel=SimpleNamespace(from_pretrained=load_model)
+            ),
+            "dots_tts.modules.backbone.dit_inference": SimpleNamespace(
+                fuse_dit_for_inference=fuse
             ),
             "dots_tts.runtime": SimpleNamespace(DotsTtsRuntime=runtime_factory),
         }

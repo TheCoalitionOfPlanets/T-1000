@@ -49,7 +49,7 @@ T-1000 is a local voice studio for experimenting with English speech synthesis a
 | **System tools** | Git, FFmpeg, and libsndfile. |
 | **Browser** | A current browser with AudioWorklet; microphone access requires localhost or HTTPS. |
 | **Storage** | About 5.2 GB for SOAR and 662 MB for the CPU recognizer, plus dependencies and caches. |
-| **Optional GPU** | NVIDIA CUDA with a compatible PyTorch build; BF16 where supported, otherwise FP16. Minimum VRAM has not been verified; see [setup](docs/setup.md). |
+| **Optional GPU** | NVIDIA CUDA with a compatible PyTorch build; BF16 where supported, otherwise FP16. NF4 inference tested on a 4 GB RTX 3050 Laptop GPU; see [measurements and limits](docs/setup.md#rtx-3050-validation--2026-10-28). |
 
 ## Installation
 
@@ -346,7 +346,9 @@ Try the bundled voice and one short English sentence. Check that your own refere
 - This interface supports English inference; training and fine-tuning are not implemented.
 - CPU requests allow 150 text characters and references up to 10 seconds. Standard CUDA requests allow 500 characters and 30-second references; experimental low-memory profiles allow 150 characters and 6-second references. References must be at least one second; uploads are capped at 32 MB.
 - Generation has a 600-second budget. Cancellation waits for the current compute step.
-- Real GPU synthesis, combined TTS/ASR memory use, and minimum VRAM remain unverified on the receiving machine.
+- Real CUDA synthesis and CPU recognition pass on a 4 GB RTX 3050 Laptop GPU with
+  the low-memory profile. See [the hardware record](docs/setup.md#rtx-3050-validation--2026-10-28)
+  for measured latency; combined CUDA TTS/ASR and other GPUs still need testing.
 - The previous CPU smoke run produced 1.92 seconds of audio in about 94 seconds, including model loading, on an Intel Core Ultra 9 185H. This is one sample, not a performance benchmark.
 
 ## Documentation

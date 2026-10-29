@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-10-28 — RTX 3050 memory and generation optimization
+
+- Fuse the acoustic decoder's inference projections on CPU before CUDA
+  placement in both low-memory profiles. This avoids roughly 440 MiB of
+  temporary CUDA copies during the first decode, allowing the NF4 profile to
+  run on the tested 4 GB RTX 3050 Laptop GPU.
+- Construct NF4 runtimes outside a caller's inference-mode context so mutable
+  inference adapters retain normal tensors.
+- Add optional four-patch eager vocoder batching for NF4 through
+  `T1000_TTS_VOCODER_BATCH_SIZE=4`. The default remains one patch. Stream
+  state, final partial groups, mutable latent buffers and compiled-mode
+  passthrough are covered by real small-vocoder tests.
+
+Validation: 121 Python tests pass locally and on the GPU laptop, including real
+small-DiT/vocoder prediction comparisons and fusion placement checks. Real upload/streaming
+transcription, browser recording, CUDA generation, WAV decoding and browser
+playback pass. With the same example voice, ten steps, seed 42 and “Hello, this
+is a voice test.”, warm browser completion fell from 11.55 seconds with CPU
+layer offload to 5.97 seconds with resident NF4 and vocoder batching (1.92
+seconds of audio in both). A longer sentence fell from 26.1 to 20.3 seconds
+after batching, retaining all requested words in 6.40 seconds of audio. NF4 still changes
+weight precision; these short checks do not establish subjective voice quality
+or performance on other GPUs. See [the setup record](docs/setup.md#rtx-3050-validation--2026-10-28).
+
 ## 2026-10-27 — Separate CPU and GPU Docker deployments
 
 - Added separate multi-stage CPU and CUDA Dockerfiles and Compose configurations.

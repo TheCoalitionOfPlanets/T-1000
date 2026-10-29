@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -9,6 +10,7 @@ import torch
 from torch import nn
 
 from t1000.low_vram import _replace_linears, load_low_vram_runtime
+from t1000.vocoder import BufferedVocoderInference
 
 
 class FakeLinear4bit(nn.Linear):
@@ -43,13 +45,22 @@ def tiny_model():
 
 
 class LowVramLoadingTests(unittest.TestCase):
+    def setUp(self):
+        environment = patch.dict(os.environ, {"T1000_TTS_VOCODER_BATCH_SIZE": "1"})
+        environment.start()
+        self.addCleanup(environment.stop)
+
     def modules(self, model, runtime):
         self.load = Mock(return_value=model)
         self.runtime = Mock(return_value=runtime)
+        self.fuse = Mock()
         return {
             "bitsandbytes.nn": SimpleNamespace(Linear4bit=FakeLinear4bit),
             "dots_tts.models.dots_tts.model": SimpleNamespace(
                 DotsTtsModel=SimpleNamespace(from_pretrained=self.load)
+            ),
+            "dots_tts.modules.backbone.dit_inference": SimpleNamespace(
+                fuse_dit_for_inference=self.fuse
             ),
             "dots_tts.runtime": SimpleNamespace(DotsTtsRuntime=self.runtime),
         }
@@ -70,6 +81,7 @@ class LowVramLoadingTests(unittest.TestCase):
 
         self.assertIs(result, runtime)
         self.load.assert_called_once_with(Path("/local/model"))
+        self.fuse.assert_called_once_with(model.core)
         converted = [module for module in model.modules() if isinstance(module, FakeLinear4bit)]
         self.assertEqual(len(converted), 2)
         self.assertIsNotNone(converted[0].bias)
@@ -105,6 +117,38 @@ class LowVramLoadingTests(unittest.TestCase):
             if isinstance(module, FakeLinear4bit):
                 self.assertEqual(module.quantization_options["compute_dtype"], torch.float16)
 
+    def test_fusion_precedes_runtime_transfer_and_creates_normal_cpu_tensors(self):
+        events = []
+        modules = self.modules(None, None)
+
+        def create_model(path):
+            self.assertFalse(torch.is_inference_mode_enabled())
+            events.append("load")
+            return tiny_model()
+
+        def fuse(core):
+            self.assertFalse(torch.is_inference_mode_enabled())
+            self.assertTrue(all(p.device.type == "cpu" for p in core.parameters()))
+            core.fused_cache = nn.Parameter(torch.zeros(1))
+            events.append("fuse")
+
+        def runtime(model, path, **settings):
+            self.assertFalse(torch.is_inference_mode_enabled())
+            self.assertFalse(torch.is_inference(model.core.fused_cache))
+            self.assertEqual(events, ["load", "fuse"])
+            events.append("runtime")
+            return model
+
+        self.load.side_effect = create_model
+        self.fuse.side_effect = fuse
+        self.runtime.side_effect = runtime
+        with patch.dict(sys.modules, modules), torch.inference_mode():
+            model = load_low_vram_runtime("/local/model", precision="bfloat16")
+        self.assertEqual(events, ["load", "fuse", "runtime"])
+        with torch.no_grad():
+            model.core.fused_cache.add_(1)
+        self.assertEqual(model.core.fused_cache.item(), 1)
+
     def test_missing_bitsandbytes_explains_installation(self):
         with patch.dict(sys.modules, {"bitsandbytes.nn": None}):
             with self.assertRaisesRegex(RuntimeError, "requirements/gpu-low-vram.txt"):
@@ -121,6 +165,80 @@ class LowVramLoadingTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "no supported linear layers"):
                 load_low_vram_runtime("/local/model", precision="float16")
         self.runtime.assert_not_called()
+        self.fuse.assert_not_called()
+
+    def test_invalid_vocoder_setting_fails_before_loading_weights(self):
+        modules = self.modules(tiny_model(), object())
+        with patch.dict(sys.modules, modules), patch.dict(
+            os.environ, {"T1000_TTS_VOCODER_BATCH_SIZE": "2"}
+        ):
+            with self.assertRaisesRegex(ValueError, "T1000_TTS_VOCODER_BATCH_SIZE"):
+                load_low_vram_runtime("/local/model", precision="bfloat16")
+        self.load.assert_not_called()
+        self.runtime.assert_not_called()
+
+    def test_vocoder_batching_is_installed_after_runtime_placement_only_when_opted_in(self):
+        model = tiny_model()
+        model._optimize_enabled = False
+        model.VOCODER_STREAM_INITIAL_UNMERGED_PATCHES = 2
+        inner = object()
+
+        def get_adapter():
+            self.assertTrue(self.runtime.called)
+            self.fuse.assert_called_once_with(model.core)
+            return inner
+
+        model._get_vocoder_inference = Mock(side_effect=get_adapter)
+        runtime = SimpleNamespace(model=model, optimize=False)
+        with patch.dict(sys.modules, self.modules(model, runtime)), patch.dict(
+            os.environ, {"T1000_TTS_VOCODER_BATCH_SIZE": "4"}
+        ):
+            self.assertIs(load_low_vram_runtime("/local/model", precision="bfloat16"), runtime)
+        self.assertIsInstance(model._vocoder_inference, BufferedVocoderInference)
+        self.assertIs(model._vocoder_inference.inner, inner)
+        self.assertEqual(self.runtime.call_args.kwargs["vocoder_merge_steps"], 1)
+
+
+class CpuInferenceFusionTests(unittest.TestCase):
+    def test_real_dit_fusion_preserves_predictions_and_parameter_storage(self):
+        from dots_tts.models.dots_tts.config import _DiTConfig
+        from dots_tts.modules.backbone.dit import DiT
+        from dots_tts.modules.backbone.dit_inference import (
+            FusedAdaLNDiT, fuse_dit_for_inference,
+        )
+
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(29)
+            dit = DiT(16, 8, _DiTConfig(
+                num_layers=2, hidden_size=16, num_heads=2,
+                ffn_hidden_size=32, modulation=True, qk_norm=True,
+                rotary_bias=True,
+            )).eval()
+            # Initial adaLN/output weights are zero; nonzero weights make the
+            # prediction comparison exercise every modulation and attention.
+            with torch.no_grad():
+                for parameter in dit.parameters():
+                    parameter.uniform_(-0.2, 0.2)
+            inputs = {
+                "x": torch.randn(2, 5, 16),
+                "timesteps": torch.tensor([0.2, 0.7]),
+                "g_cond": torch.randn(2, 16),
+                "attn_mask": torch.ones(5, 5, dtype=torch.bool).tril()[None],
+            }
+        core = nn.Module()
+        core.velocity_field_predictor = dit
+        original_count = sum(p.numel() for p in dit.parameters())
+        with torch.no_grad():
+            expected = dit(**inputs)
+            fused = fuse_dit_for_inference(core)
+            actual = fused(**inputs)
+        self.assertIsInstance(fused, FusedAdaLNDiT)
+        self.assertIs(core.velocity_field_predictor, fused)
+        self.assertIs(fuse_dit_for_inference(core), fused)
+        self.assertEqual(sum(p.numel() for p in fused.parameters()), original_count)
+        self.assertTrue(all(p.device.type == "cpu" for p in fused.parameters()))
+        self.assertFalse(any("adaLN_modulation" in n for n, _ in fused.named_parameters()))
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 
 @unittest.skipUnless(importlib.util.find_spec("bitsandbytes"), "bitsandbytes is an optional dependency")
