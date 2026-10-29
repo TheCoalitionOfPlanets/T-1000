@@ -1,5 +1,110 @@
 # Changelog
 
+## 2026-10-29 — Paragraph generation
+
+- Raise the full request limit to 5,000 characters and label the editor counter
+  explicitly as characters. Plan longer text into sentence-aware parts within
+  the existing 150-character CPU/low-memory or 500-character standard CUDA cap.
+- Use the same full reference and transcript for every part, preserving all
+  input words and generated samples in one WAV. Add only missing quiet pauses
+  at joins; require every part to reach EOS before declaring completion.
+- Show part progress and preserve incomplete output on cancellation, inference
+  failure or a model cap. Allow 30 minutes for multi-part requests and cap output
+  at 10 minutes; expand verified WAV transfers to 64 MiB.
+
+Validation: 255 backend tests pass locally and on the RTX 3050, alongside 53
+browser checks and the production build. A real 290-character, two-paragraph
+request completed three parts and produced 15.09 seconds of speech in 41.76
+seconds. CPU ASR matched all 52 requested words after case and punctuation
+normalization. The short seeded regression WAV remains byte-identical to the
+previous deployment. These checks do not establish subjective naturalness or
+cloning similarity.
+
+## 2026-10-29 — Recording integrity and recoverable generation
+
+- Batch microphone capture in 20 ms worklet chunks with ordered offsets, sample
+  acknowledgements and final-tail flushing. Reconcile complete captured PCM on
+  finish, retry immutable payloads and retain a local recovery WAV on save failure.
+- Preserve the same completed reference across lost finish responses. Serialize
+  concurrent finish/cancel operations and retry full-file ASR when previews fail.
+- Move PCM ownership into a worker that writes an incremental, atomically
+  published WAV with sample count, completion reason and SHA-256 metadata.
+- Add bounded generation jobs with same-ID reconnects, progress cursors and
+  request-scoped Stop. Resume WAV downloads with HTTP Range and verify the whole
+  file before sharing one buffered Blob between playback and waveform rendering.
+
+Validation: 233 backend tests pass locally and on the RTX 3050; 52 browser checks,
+the production build and 16 live API/browser stages pass. The actual worklet
+reference retained all 68,864 captured samples, including 8,064 after the last
+feed acknowledgement. Reconnect, Range recovery, stale Stop isolation and explicit
+partial cancellation pass. Two seeded before/after WAVs are byte-identical. This
+change improves transfer reliability without establishing a new compute speedup.
+
+## 2026-10-29 — Vocoder compilation and comparison experiments
+
+- Add opt-in FP32 vocoder-only compilation through
+  `T1000_TTS_COMPILE_VOCODER=1`, with bounded startup warmup and CUDA graphs
+  disabled. Retain the existing SOAR sampling and four-patch buffering.
+- Add reproducible SOAR/MF2 and isolated-vocoder comparison scripts with timing,
+  memory, waveform and ASR scoring. Keep native LSTM, rotary reuse, reduced
+  decoder precision and eight-patch buffering as disabled experimental variants.
+
+Validation: eight unique English cases with two timed repeats per configuration
+gave 16 complete requests each. The compiled FP32 candidate achieved a 1.099×
+median paired speed ratio, or 9.0% lower matched generation latency; aggregate
+median generation times were 11.062 seconds before and 9.983 seconds after.
+Both unique eight-case sets had zero ASR word errors out of 80 words. The
+compiled outputs have small waveform differences, so these measurements do not
+establish audio identity, subjective quality or performance beyond the tested
+RTX 3050 inputs.
+
+## 2026-10-29 — Conditioning reuse and reference/text accuracy safeguards
+
+- Add optional request-scoped reuse of eager Euler timestep conditioning via
+  `T1000_TTS_EAGER_CACHE=1`. It preserves the original solver and sampling
+  arithmetic, checks voice/timestep consistency, and defaults off.
+- Preserve quiet reference boundaries instead of silently applying the upstream
+  30 dB trimming threshold. Cache CPU prompt preprocessing by content, bounded
+  to eight entries/16 MiB; `T1000_REFERENCE_TRIM=1` restores upstream trimming.
+- Add explicit English text-expansion preview with Apply, Cancel and Undo.
+  Ambiguous formatted phone numbers require manual spelling. Reference
+  transcripts are never normalized.
+- Add API/browser request timing milestones and opt-in local-server startup
+  preload with `T1000_PRELOAD_MODELS=1`.
+
+Validation: 150 backend tests pass locally and on the RTX 3050 laptop, along
+with nine browser checks and both production builds. A two-run warm comparison
+measured 5.709 seconds without conditioning reuse versus 5.578 seconds with it
+(2.3% lower), with bit-identical audio. This small sample is not a statistical
+performance guarantee. Four sentences with complete reference audio retained
+every requested word in normalized ASR checks. Quiet-boundary tests reproduce
+the old trimming loss; preserving the reference can change pacing and duration.
+These checks do not establish general accuracy or subjective speaker quality.
+
+## 2026-10-28 — RTX 3050 memory and generation optimization
+
+- Fuse the acoustic decoder's inference projections on CPU before CUDA
+  placement in both low-memory profiles. This avoids roughly 440 MiB of
+  temporary CUDA copies during the first decode, allowing the NF4 profile to
+  run on the tested 4 GB RTX 3050 Laptop GPU.
+- Construct NF4 runtimes outside a caller's inference-mode context so mutable
+  inference adapters retain normal tensors.
+- Add optional four-patch eager vocoder batching for NF4 through
+  `T1000_TTS_VOCODER_BATCH_SIZE=4`. The default remains one patch. Stream
+  state, final partial groups, mutable latent buffers and compiled-mode
+  passthrough are covered by real small-vocoder tests.
+
+Validation: 121 Python tests pass locally and on the GPU laptop, including real
+small-DiT/vocoder prediction comparisons and fusion placement checks. Real upload/streaming
+transcription, browser recording, CUDA generation, WAV decoding and browser
+playback pass. With the same example voice, ten steps, seed 42 and “Hello, this
+is a voice test.”, warm browser completion fell from 11.55 seconds with CPU
+layer offload to 5.97 seconds with resident NF4 and vocoder batching (1.92
+seconds of audio in both). A longer sentence fell from 26.1 to 20.3 seconds
+after batching, retaining all requested words in 6.40 seconds of audio. NF4 still changes
+weight precision; these short checks do not establish subjective voice quality
+or performance on other GPUs. See [the setup record](docs/setup.md#rtx-3050-validation--2026-10-28).
+
 ## 2026-10-27 — Separate CPU and GPU Docker deployments
 
 - Added separate multi-stage CPU and CUDA Dockerfiles and Compose configurations.

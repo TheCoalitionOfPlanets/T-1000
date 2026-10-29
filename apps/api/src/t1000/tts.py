@@ -20,7 +20,11 @@ import torch
 
 from . import stt
 from .inference_settings import get_inference_settings
+from .eager import configure_eager_cache, read_eager_cache_enabled
+from .compiled_vocoder import configure_compiled_vocoder, read_compiled_vocoder_enabled
+from .references import configure_prompt_audio
 from .mic import consume_complete
+from .paragraphs import REQUEST_TEXT_LIMIT, plan_text
 from .paths import ASSETS, CACHE, MODELS, OUTPUT
 
 MODEL_PATH = MODELS / "dots.tts-soar"
@@ -30,8 +34,11 @@ EXAMPLE_TRANSCRIPT = "We asked over twenty different people, and they all said i
 DEVICE = "CUDA GPU" if torch.cuda.is_available() else "CPU"
 INFERENCE_SETTINGS = get_inference_settings()
 REFERENCE_LIMIT = INFERENCE_SETTINGS.reference_limit
-TEXT_LIMIT = INFERENCE_SETTINGS.text_limit
+TEXT_LIMIT = REQUEST_TEXT_LIMIT
+SEGMENT_TEXT_LIMIT = INFERENCE_SETTINGS.text_limit
 GENERATION_TIMEOUT = 600
+PARAGRAPH_TIMEOUT = 1800
+MAX_OUTPUT_SECONDS = 600
 MODEL_LOCK = threading.Lock()
 ACTIVE_LOCK = threading.Lock()
 ACTIVE_STOP = None
@@ -47,16 +54,25 @@ def load_runtime():
     if not (MODEL_PATH / "model.safetensors").is_file():
         raise RuntimeError("Model weights are missing. Follow the README download instructions.")
     settings = get_inference_settings()
+    eager_cache = read_eager_cache_enabled()
+    compiled_vocoder = read_compiled_vocoder_enabled()
+    if compiled_vocoder and settings.profile != "low-vram":
+        raise ValueError("T1000_TTS_COMPILE_VOCODER=1 requires the low-vram profile.")
     if settings.profile == "low-vram":
         from .low_vram import load_low_vram_runtime
 
         LOGGER.info("Loading experimental low-VRAM SOAR: NF4 language backbone, eager acoustic decoding.")
-        return load_low_vram_runtime(MODEL_PATH, precision=settings.precision)
+        runtime = load_low_vram_runtime(MODEL_PATH, precision=settings.precision)
+        configure_prompt_audio(runtime)
+        configure_eager_cache(runtime, eager_cache)
+        return configure_compiled_vocoder(runtime, enabled=compiled_vocoder)
     if settings.profile == "offload":
         from .offload import load_offloaded_runtime
 
         LOGGER.info("Loading experimental SOAR CPU offload with %s GPU-resident language blocks.", settings.gpu_layers)
-        return load_offloaded_runtime(MODEL_PATH, precision=settings.precision, gpu_layers=settings.gpu_layers)
+        runtime = load_offloaded_runtime(MODEL_PATH, precision=settings.precision, gpu_layers=settings.gpu_layers)
+        configure_prompt_audio(runtime)
+        return configure_eager_cache(runtime, eager_cache)
     optimize = settings.optimize
     if optimize:
         LOGGER.info(
@@ -78,7 +94,8 @@ def load_runtime():
             runtime.run_warmup()
     if runtime.device.type == "cpu":
         torch.set_num_threads(min(6, os.cpu_count() or 1))
-    return runtime
+    configure_prompt_audio(runtime)
+    return configure_eager_cache(runtime, eager_cache)
 
 
 def read_reference(path):
@@ -230,7 +247,7 @@ def stop_generation():
             ACTIVE_STOP.set()
 
 
-def synthesize(text, reference_audio, transcript, steps, seed):
+def synthesize(text, reference_audio, transcript, steps, seed, *, cancel_event=None):
     global ACTIVE_STOP
 
     text = (text or "").strip()
@@ -238,7 +255,11 @@ def synthesize(text, reference_audio, transcript, steps, seed):
     if not text:
         raise gr.Error("Enter the text you want to hear.")
     if len(text) > TEXT_LIMIT:
-        raise gr.Error(f"Keep each test under {TEXT_LIMIT} characters.")
+        raise gr.Error(f"Keep each request under {TEXT_LIMIT} characters.")
+    try:
+        segments = plan_text(text, SEGMENT_TEXT_LIMIT)
+    except ValueError as exc:
+        raise gr.Error(str(exc)) from exc
     if not reference_audio:
         raise gr.Error("Add a reference recording, or keep the preloaded example voice.")
     if not transcript:
@@ -253,110 +274,196 @@ def synthesize(text, reference_audio, transcript, steps, seed):
     request_dir.mkdir(parents=True, exist_ok=True)
     reference_path = request_dir / f"reference-{uuid4().hex}.wav"
     sf.write(reference_path, reference, reference_rate, subtype="PCM_16")
-    messages = queue.Queue()
-    cancel = threading.Event()
+    # PCM is spooled by the producer, independently of the HTTP consumer.
+    # Only small progress messages cross this bounded queue.
+    messages = queue.Queue(maxsize=8)
+    cancel = cancel_event if cancel_event is not None else threading.Event()
+    worker_done = threading.Event()
+    outcome = {"audio": None, "error": None, "reason": "cancelled", "segments_completed": 0}
+    timeout_seconds = GENERATION_TIMEOUT if len(segments) == 1 else max(GENERATION_TIMEOUT, PARAGRAPH_TIMEOUT)
     with ACTIVE_LOCK:
         ACTIVE_STOP = cancel
     started = time.perf_counter()
 
+    def notify(kind, payload=None):
+        while not cancel.is_set():
+            try:
+                messages.put((kind, payload), timeout=0.1)
+                return True
+            except queue.Full:
+                pass
+        return False
+
     def run():
         global ACTIVE_STOP
+        writer = None
+        natural_end = False
+        reason = "cancelled"
         try:
+            from .audio_integrity import AtomicAudioWriter, DecodeEndObserver
             with MODEL_LOCK, stt.gpu_compute_lock():
                 if cancel.is_set():
                     return
                 stt.release_gpu_model()
                 from dots_tts.utils.util import seed_everything
-
                 runtime = load_runtime()
                 if cancel.is_set():
                     return
-                messages.put(("ready", None))
+                notify("ready")
                 if runtime.device.type == "cpu":
                     torch.set_num_threads(min(6, os.cpu_count() or 1))
                 seed_everything(int(seed))
+                writer = AtomicAudioWriter(OUTPUT_DIR, runtime.sample_rate)
+                maximum_samples = int(MAX_OUTPUT_SECONDS * runtime.sample_rate)
+                trailing_quiet = 0
+
+                def append_audio(audio):
+                    nonlocal reason
+                    remaining = maximum_samples - writer.frames
+                    limited = audio.size > remaining
+                    if remaining > 0 and audio.size:
+                        start_sample, count = writer.append(audio[:remaining])
+                        notify("audio", (start_sample + count, runtime.sample_rate))
+                    if limited:
+                        reason = "audio_limit"
+                        outcome["error"] = f"The output reached its {MAX_OUTPUT_SECONDS / 60:g}-minute audio limit. Generate the remaining text separately."
+                    return not limited
+
                 with torch.inference_mode():
-                    stream = runtime.generate_stream(
-                        text=text,
-                        prompt_audio_path=str(reference_path),
-                        prompt_text=transcript,
-                        language="en",
-                        num_steps=int(steps),
-                        guidance_scale=1.2,
-                    )
-                    try:
-                        for chunk in stream:
-                            if cancel.is_set():
-                                break
-                            audio = chunk.detach().float().cpu().reshape(-1).numpy().copy()
-                            if not np.isfinite(audio).all():
-                                raise RuntimeError("The model returned invalid audio.")
-                            if audio.size:
-                                messages.put(("audio", (audio, runtime.sample_rate)))
-                    finally:
-                        stream.close()
+                    for index, segment in enumerate(segments):
+                        if cancel.is_set():
+                            reason = "cancelled"
+                            break
+                        notify("segment", (index + 1, len(segments)))
+                        segment_end = False
+                        first_audio = True
+                        with DecodeEndObserver(getattr(runtime, "model", None)) as observer:
+                            stream = runtime.generate_stream(
+                                text=segment.text, prompt_audio_path=str(reference_path), prompt_text=transcript,
+                                language="en", num_steps=int(steps), guidance_scale=1.2,
+                            )
+                            try:
+                                while not cancel.is_set():
+                                    try:
+                                        chunk = next(stream)
+                                    except StopIteration:
+                                        segment_end = True
+                                        break
+                                    # Preserve the chunk that finished during
+                                    # Stop, then start no further model step.
+                                    audio = chunk.detach().float().cpu().reshape(-1).numpy()
+                                    if not audio.size:
+                                        continue
+                                    loud = np.flatnonzero(np.abs(audio) > 0.001)
+                                    if first_audio:
+                                        # Keep every generated sample. Add only
+                                        # the missing quiet gap at a text break,
+                                        # after the next part actually exists.
+                                        leading_quiet = int(loud[0]) if loud.size else audio.size
+                                        pause = max(0, round(segment.pause_before * runtime.sample_rate)
+                                                    - trailing_quiet - leading_quiet)
+                                        if pause and not append_audio(np.zeros(pause, dtype=np.float32)):
+                                            break
+                                        trailing_quiet += pause
+                                        first_audio = False
+                                    if not append_audio(audio):
+                                        break
+                                    trailing_quiet = audio.size - int(loud[-1]) - 1 if loud.size else trailing_quiet + audio.size
+                            finally:
+                                stream.close()
+                            segment_reason = observer.stop_reason
+                        if outcome["error"]:
+                            break
+                        reason = segment_reason
+                        if segment_end and reason in {"unknown", "not_started"}:
+                            reason = "stream_complete"  # Legacy/test runtime.
+                        if segment_end and reason in {"eos", "stream_complete"}:
+                            if first_audio:
+                                raise RuntimeError(f"Part {index + 1} produced no audio. The remaining text was not generated.")
+                            outcome["segments_completed"] += 1
+                            natural_end = outcome["segments_completed"] == len(segments)
+                        elif reason == "schedule_exhausted":
+                            outcome["error"] = f"Part {index + 1} reached the model's audio length limit. The saved audio is incomplete; use shorter sentences."
+                            break
+                        else:
+                            reason = "cancelled" if cancel.is_set() else reason
+                            break
+                if not natural_end and cancel.is_set() and not outcome["error"]:
+                    reason = "cancelled"
         except Exception as exc:
             LOGGER.exception("Speech generation failed")
-            messages.put(("error", str(exc)))
+            outcome["error"] = str(exc)
+            reason = "error"
         finally:
-            reference_path.unlink(missing_ok=True)
-            with ACTIVE_LOCK:
-                if ACTIVE_STOP is cancel:
-                    ACTIVE_STOP = None
-            messages.put(("done", None))
+            try:
+                if writer is not None:
+                    complete = natural_end and reason in {"eos", "stream_complete"} and not outcome["error"]
+                    outcome["audio"] = writer.finish(complete=bool(complete), reason=reason)
+                    if outcome["audio"] is not None:
+                        outcome["audio"].metadata.update(segments_total=len(segments),
+                                                         segments_completed=outcome["segments_completed"])
+                outcome["reason"] = reason
+            except Exception as exc:
+                LOGGER.exception("Generated audio could not be finalized")
+                outcome["error"] = f"Audio finalization failed: {exc}"
+            try:
+                reference_path.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.warning("Temporary reference cleanup failed", exc_info=True)
+            finally:
+                try:
+                    with ACTIVE_LOCK:
+                        if ACTIVE_STOP is cancel:
+                            ACTIVE_STOP = None
+                finally:
+                    worker_done.set()
 
     worker = threading.Thread(target=run, name="speech-generation", daemon=True)
-    chunks = []
+    total_samples = 0
     sample_rate = 48000
-    error = None
     timed_out = False
     runtime_ready = False
-    worker.start()
+    current_segment = 1
+    launched = False
     try:
+        worker.start()
+        launched = True
         yield gr.skip(), "Loading the speech model and preparing inference…", gr.update(interactive=False), gr.update(interactive=True)
-        while True:
+        while not worker_done.is_set() or not messages.empty():
             elapsed = time.perf_counter() - started
-            if elapsed >= GENERATION_TIMEOUT:
+            if elapsed >= timeout_seconds:
                 timed_out = True
                 cancel.set()
             try:
-                kind, payload = messages.get(timeout=0.5)
-                if kind == "done":
-                    break
-                if kind == "error":
-                    error = payload
-                elif kind == "ready":
+                kind, payload = messages.get(timeout=0.1)
+                if kind == "ready":
                     runtime_ready = True
                 elif kind == "audio":
-                    audio, sample_rate = payload
-                    chunks.append(audio)
+                    total_samples, sample_rate = payload
+                elif kind == "segment":
+                    current_segment, _ = payload
             except queue.Empty:
                 pass
-            duration = sum(chunk.size for chunk in chunks) / sample_rate
+            duration = total_samples / sample_rate
             if cancel.is_set():
                 reason = "Time limit reached" if timed_out else "Stop requested"
                 status = f"{reason}; finishing the current audio step… Elapsed {elapsed:.0f}s."
             elif not runtime_ready:
                 status = f"Loading and warming the speech model · elapsed {elapsed:.0f}s."
-                if DEVICE != "CPU":
-                    status += " First GPU use can take several minutes."
             else:
-                status = f"Generating on {DEVICE} · elapsed {elapsed:.0f}s · produced {duration:.2f}s of audio."
+                part = f"part {current_segment} of {len(segments)} · " if len(segments) > 1 else ""
+                status = f"Generating on {DEVICE} · {part}elapsed {elapsed:.0f}s · produced {duration:.2f}s of audio."
             yield gr.skip(), status, gr.update(interactive=False), gr.update(interactive=True)
 
         elapsed = time.perf_counter() - started
-        path = None
-        duration = 0
-        if chunks:
-            audio = np.concatenate(chunks)
-            duration = audio.size / sample_rate
-            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-            path = OUTPUT_DIR / f"speech-{uuid4().hex[:12]}.wav"
-            sf.write(path, audio, sample_rate, subtype="PCM_16")
-        if error:
-            status = f"Generation failed: {error}"
-        elif cancel.is_set():
-            reason = f"Stopped at the {GENERATION_TIMEOUT / 60:g}-minute time limit" if timed_out else "Stopped"
+        path = outcome["audio"]
+        duration = path.metadata["total_samples"] / path.metadata["sample_rate"] if path else 0
+        if outcome["error"]:
+            status = f"Generation failed: {outcome['error']}"
+            if path:
+                status += f" Saved {duration:.2f}s of partial audio."
+        elif cancel.is_set() and (path is None or not path.metadata["complete"]):
+            reason = f"Stopped at the {timeout_seconds / 60:g}-minute time limit" if timed_out else "Stopped"
             status = f"{reason} after {elapsed:.1f}s."
             if path:
                 status += f" Saved {duration:.2f}s of partial audio. Check that the reference transcript matches the recording."
@@ -364,7 +471,17 @@ def synthesize(text, reference_audio, transcript, steps, seed):
             status = f"Generated {duration:.2f}s of audio in {elapsed:.1f}s on {DEVICE}."
         else:
             status = "No audio was produced. Try another reference recording."
-        yield str(path) if path else gr.skip(), status, gr.update(interactive=True), gr.update(interactive=False)
+        yield path if path else gr.skip(), status, gr.update(interactive=True), gr.update(interactive=False)
     finally:
-        # Also stop computation when the browser/client closes the generator.
         cancel.set()
+        # Never release the inference slot while its producer is still inside
+        # the current model step. The producer always owns/finalizes the WAV.
+        if launched or worker.ident is not None:
+            worker_done.wait()
+        else:
+            try:
+                reference_path.unlink(missing_ok=True)
+            finally:
+                with ACTIVE_LOCK:
+                    if ACTIVE_STOP is cancel:
+                        ACTIVE_STOP = None

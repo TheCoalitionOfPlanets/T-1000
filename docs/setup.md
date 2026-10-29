@@ -1,6 +1,6 @@
 # T-1000 setup
 
-Updated: 2026-10-27. Repository: https://github.com/TheCoalitionOfPlanets/T-1000
+Updated: 2026-10-29. Repository: https://github.com/TheCoalitionOfPlanets/T-1000
 
 ## Goal and current state
 
@@ -10,10 +10,10 @@ inference demo; training and fine-tuning are not implemented in this repository.
 The [dataset survey](datasets.pdf) and [voice-cloning study guide](voice-cloning.pdf)
 are background research, not executable training recipes.
 
-The source machine has CPU-only PyTorch. Its inference and transcription tests pass,
-and a previous real CPU run produced 1.92 seconds of 48 kHz audio from
-“Hello, this is a voice test.” GPU inference and GPU memory requirements have
-not been measured. Record the receiving machine's GPU results below after testing.
+The source machine has CPU-only PyTorch. A receiving RTX 3050 Laptop GPU has
+also completed real CUDA synthesis, transcription and browser checks. See the
+[receiving-machine measurements](#rtx-3050-validation--2026-10-28) below; fit and
+performance still depend on the GPU, active workloads and input length.
 
 ## Files and pinned versions
 
@@ -189,11 +189,20 @@ If ASR fails, its setup error is shown and complete audio remains available for
 manual transcription. A current browser with AudioWorklet and microphone
 permission is required, on localhost or HTTPS.
 
-Standard GPU text is limited to 500 characters; CPU text to 150 characters.
+The editor and API accept up to **5,000 characters**, including multiple
+paragraphs. The counter measures characters, not words. Long input is planned
+into sentence-aware parts that fit the existing model context: up to 150
+characters on CPU and low-memory GPU profiles, or 500 on standard CUDA. Parts
+run sequentially with the same full reference and transcript, then join in one
+WAV without trimming generated speech. Short input within the part limit keeps
+its original single-call behavior. Existing quiet samples at boundaries are
+retained; only a missing brief pause is padded at a sentence or paragraph break.
+
 References are limited to 10 seconds with CPU TTS and 30 seconds with standard
-CUDA TTS. Experimental low-memory profiles use 150 characters and 6-second
-references. Generation
-has a 600-second budget. **Stop generation** and the
+CUDA TTS. Experimental low-memory profiles keep 6-second references. Generation
+has a 600-second budget for one part or 1,800 seconds for multiple parts, and
+output audio is capped at 10 minutes. A model cap, error or cancellation stops
+the remaining parts and labels the saved result incomplete. **Stop generation** and the
 deadline request cancellation after the current audio step and preserve any
 partial output; they do not immediately interrupt a running CUDA operation.
 
@@ -211,6 +220,49 @@ For frontend editing, keep `.venv/bin/python -m t1000` running and use
 `.venv/bin/python -m t1000.ui` and preloads the model at startup. Stop `t1000.api`
 before using it because both entry points bind port 7860.
 
+## Recording, reconnects and playback
+
+The React recorder collects PCM in 20 ms worklet batches and coalesces it into
+serialized network feeds every 500 ms when the previous feed has finished. Ordered
+chunk and cumulative sample acknowledgements detect duplicate, missing or changed data.
+Finishing waits for the worklet's final partial batch, then reconciles the complete
+captured PCM with the server. A failed save keeps the complete recording in the
+open tab for download or retry. Live STT is a preview; review the final reference
+transcript before generating speech. CPU STT can run while audio is captured and
+transferred, while GPU synthesis remains serialized.
+
+Generation uses one immutable request ID and payload. A broken progress connection
+reconnects to that job with its last accepted sequence; it does not start a second
+inference. **Stop generation** targets that request. The worker writes ordered
+PCM16 samples to a temporary WAV and publishes the closed file atomically with a
+sample count and SHA-256 manifest. The browser resumes interrupted WAV transfers
+with HTTP Range, verifies bytes, checksum and WAV frames, then shares one buffered
+Blob between playback and the waveform. Complete buffering avoids playback gaps
+when synthesis runs slower than real time. Cancelled, failed or capped output is
+explicitly marked partial rather than complete speech.
+
+| Recovery bound | Current value |
+| --- | --- |
+| No progress subscribers | Cancel after a 60-second reconnect grace period; preserve produced audio as partial |
+| Completed generation jobs | Latest 16, retained for up to 15 minutes |
+| Completed recording finalization receipts | Latest 64, retained for up to 15 minutes |
+| Browser generation transport | Initial attempt plus at most 3 retries; 10-second header and 30-second progress deadlines |
+| Verified WAV transfer | At most 3 attempts; 64 MiB maximum (10-minute generated-audio cap) |
+
+Retention is bounded and expires on later requests or cleanup. These are in-tab
+retries against the running server, not durable recovery across a server restart.
+The interface offers **Reconnect to generation**, or **Stop and reset** to retain
+the reference and text while clearing a failed request. Download a recovered
+recording before closing its tab. WAV publication is atomic, but this is not a
+power-loss durability guarantee.
+
+The full reference and whole synthesis utterance remain intact. Transport batches
+do not split text into independent TTS requests or alter the model, sampling steps,
+voice conditioning or numerical precision. These changes protect transfer and
+continuity; they do not establish better transcription, pronunciation or speaker
+similarity. The [lossless-flow validation report](../data/output/3050-lossless-flow/RESULTS.md)
+records the checks and their scope.
+
 ## GPU inference performance
 
 The `auto` profile selects experimental NF4 inference on CUDA GPUs with 6 GiB or
@@ -220,7 +272,7 @@ warmup can use substantial memory. `T1000_TTS_OPTIMIZE=1` explicitly enables tha
 path in the standard profile; `0` disables it. CPU inference stays eager.
 
 All profiles use the local SOAR checkpoint, full reference audio/text conditioning,
-sampling controls and one-patch vocoder chunks. Standard and offload profiles keep
+sampling controls and one-patch vocoder chunks by default. Standard and offload profiles keep
 unquantized weights. Quantized or compiled arithmetic can change output, so
 compare voice similarity, tone, pacing, pronunciation and completeness.
 
@@ -238,10 +290,14 @@ resident checkpoint cannot fit on a 4 GiB GPU by merely disabling compilation.
 | `offload`, GPU layers `0` | Acoustic modules and token embeddings stay on CUDA; language blocks are stored in CPU RAM and loaded onto CUDA for each forward call. | Preserves unquantized weights and lowers resident VRAM, but repeated transfers generally increase latency. |
 | `offload`, GPU layers `14` | Keep half the bundled language model's 28 decoder blocks on CUDA and offload the rest. | Fewer transfers, more VRAM. This is not half of the complete TTS model, and may be too large for 4 GB. |
 
-Both low-memory modes disable compilation, cap the runtime at 128 total audio
-patches and a 512-position language context, and accept at most 150 text characters
-and 6-second references. Long utterances can hit the audio cap; listen for complete
-speech. Use the default CPU transcription backend so ASR does not compete for VRAM.
+Both low-memory modes disable full-model compilation, cap each inference part at
+128 total audio patches and a 512-position language context, and use at most 150
+text characters per part with 6-second references. Paragraph requests accept up
+to 5,000 characters through sequential parts. A part that hits the audio cap
+stops the request with an explicit incomplete result. Use the default CPU
+transcription backend so ASR does not compete for VRAM.
+The loaders fuse acoustic inference weights on CPU before placement, avoiding
+temporary duplicate weights on CUDA during the first decode.
 The full checkpoint is still loaded into CPU RAM initially: these profiles do not
 provide disk streaming or reduce the initial host-RAM requirement.
 
@@ -251,6 +307,19 @@ After installing the low-VRAM requirements, launch either profile explicitly:
 T1000_TTS_PROFILE=low-vram .venv/bin/python -m t1000
 T1000_TTS_PROFILE=offload T1000_TTS_GPU_LAYERS=0 .venv/bin/python -m t1000
 ```
+
+For faster NF4 generation, opt into eager vocoder batching with
+`T1000_TTS_VOCODER_BATCH_SIZE=4` (default `1`; other values are rejected).
+It emits the first two patches separately, then decodes groups of four to
+reduce repeated work. Model weights and sampling steps stay the same; CUDA
+kernel rounding can produce small waveform differences. Stop can wait for up
+to four acoustic patches between output chunks. This setting applies only to
+the eager NF4 loader; standard and compiled inference retain upstream behavior.
+
+`T1000_TTS_EAGER_CACHE=1` additionally reuses voice-conditioned Euler timestep
+projections within a generation, without changing the upstream solver or
+sampling steps. It defaults to `0` and bypasses unsupported solver modes.
+The tested gain was small; see the pipeline measurements below.
 
 Only run one server at a time. Restart to change profiles. Automatic selection on
 a 4–6 GB GPU chooses `low-vram`; an explicitly enabled compile flag must be removed
@@ -268,8 +337,8 @@ Run each approach in a separate process on the actual GPU:
 ```
 
 Start offload with zero resident decoder blocks on 4 GB. Increase the count only
-after measuring headroom. Neither profile has been verified within a 4 GB ceiling
-on the CPU-only development machine.
+after measuring headroom. Both profiles have completed the short receiving-machine
+test below; that result does not guarantee every permitted input will fit.
 
 The first model load runs upstream compilation and warmup, which can take several
 minutes and uses extra GPU memory when standard compilation is enabled. In the web app it currently counts toward the
@@ -305,7 +374,7 @@ Low-memory profiles fix their audio cap at 128 patches; pass
 `--max-generate-length 128` to standard benchmark runs when comparing across
 profiles. The benchmark enforces each profile's text and reference limits;
 start with short inputs and check that output is complete.
-Real GPU performance remains unverified on the CPU-only development machine.
+The receiving-machine measurements below provide one hardware result.
 
 The browser currently receives status updates during synthesis and plays a WAV
 after generation completes. The benchmark's first-chunk measurement describes
@@ -333,13 +402,111 @@ the model output; it is not browser playback latency.
   torch/torchaudio pins together. Gradio 6.17.3 replaces upstream's unpublished
   6.17.0 pin. Re-run `uv pip check` after changes.
 
-After successful setup, update this section (and [`CHANGELOG.md`](../CHANGELOG.md) for code changes)
+After testing another machine, update this section (and [`CHANGELOG.md`](../CHANGELOG.md) for code changes)
 with OS, GPU/VRAM, driver, Python/torch/CUDA versions, code commit, model revision,
-test results, generation time, output duration, and any fixes. GPU setup remains
-unverified until the receiving agent completes the real generation above.
+test results, generation time, output duration, and any fixes.
+
+### RTX 3050 validation — 2026-10-28
+
+Tested Arch Linux, kernel 6.18.56-1-lts, NVIDIA driver 615.78.08,
+RTX 3050 Laptop GPU advertised as 4096 MiB (3.73 GiB usable through PyTorch),
+16 GB system RAM, Python 3.11.15, and torch/torchaudio 2.8.0+cu128.
+The code was `0346bf2` plus the CPU inference-fusion changes above, with the
+pinned SOAR revision in this guide. All three checkpoint hashes matched upstream.
+CPU Nemotron recognition was used; CUDA recognition was not exercised.
+
+Before CPU fusion, NF4 loaded but failed while allocating the first decoder's
+220 MiB fused projection. Moving the same fusion to CPU resolved that failure.
+The tested launch environment is:
+
+```sh
+STT_BACKEND=cpu T1000_TTS_PROFILE=low-vram T1000_TTS_OPTIMIZE=0 \
+  T1000_TTS_VOCODER_BATCH_SIZE=4 \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True .venv/bin/python -m t1000
+```
+
+For “Hello, this is a voice test.” with the bundled reference, ten steps and
+seed 42, both profiles produced 1.92 seconds of finite, non-silent 48 kHz audio:
+
+| Profile | First request, including load | Warm browser completion |
+| --- | ---: | ---: |
+| Offload, zero resident language blocks | 45.37 s | 11.55 s |
+| NF4 with CPU inference fusion, batch size 1 | 58.99 s | 7.48 s |
+| NF4 with CPU inference fusion, batch size 4 | 61.18 s | 5.97 s |
+
+The warm comparison is one browser request per profile over an SSH tunnel,
+including API/UI completion; it is not a repeated statistical benchmark.
+Recognition recovered the requested words from the tested WAVs. 121 backend tests,
+real upload and streaming-PCM recognition, real browser AudioWorklet recording
+using prerecorded input, WAV decoding, download and player playback passed.
+Cold loading used substantial host RAM and swap. Keep the model process running
+to reuse its loaded weights. Subjective voice similarity and longer-input memory
+headroom require separate evaluation. A 100-character sentence also completed
+with batch size 4: 6.40 seconds of audio in 20.28 seconds, versus 26.1 seconds
+with batch size 1. Recognition recovered every requested word, allowing
+punctuation/case differences.
+
+A separate two-run comparison in one resident NF4 process measured median
+generation times of 7.00 seconds with one-patch vocoding and 5.80 seconds with
+four-patch vocoding. Both produced 92,160 samples. Peak allocated CUDA memory
+was 3449.2 and 3449.7 MiB respectively. Waveform RMS difference was 0.0575% of
+the baseline RMS (64.8 dB signal-to-error ratio); maximum absolute difference
+was 0.000484. A strict pointwise `allclose` check failed, so these results
+establish small aggregate numerical error rather than bit-identical audio or
+subjective perceptual equivalence. Separate synchronized profiles attributed
+most of the gain to vocoding, which fell from 3.33 to 2.10 seconds. Profiling
+requests were excluded from the timed medians.
+
+### Pipeline validation — 2026-10-29
+
+With the same RTX 3050, reference, seed and ten Euler steps, a two-run resident
+model comparison measured 5.709 seconds without the conditioning cache and
+5.578 seconds with it (2.3% lower). Generated float samples were bit-identical.
+This is a small measured difference, not a statistical speed guarantee.
+
+The runtime now preserves every reference sample by default, preventing the
+upstream 30 dB trim from silently removing quiet opening/closing phonemes.
+`T1000_REFERENCE_TRIM=1` explicitly restores the old trimming. CPU preprocessing
+is cached by audio content with an eight-entry/16 MiB limit. Speaker/latent
+features retain the upstream cache; no extra prompt cache is placed on CUDA.
+Preserving a full reference can change pacing and output length, so timings
+between trimmed and complete references are not directly interchangeable.
+
+With complete reference audio and the conditioning cache, all four test
+sentences matched their requested words in normalized ASR checks. The short
+sentence produced 1.92 seconds of audio in 5.73 seconds; the 100-character
+sentence produced 7.04 seconds in 22.81 seconds. These checks do not measure
+subjective speaker similarity or establish a general word-error rate.
+
+Use **Expand numbers** to preview English number/abbreviation expansions, then
+review and Apply or Cancel. Undo restores the original. The tool does not
+change reference transcripts, and ambiguous formatted phone numbers require
+manual spelling. Dates and money still need review for the intended reading.
+
+For the local API, `T1000_PRELOAD_MODELS=1` loads TTS and CPU recognition before
+opening the server, moving model loading into startup. This delays readiness
+instead of making loading itself faster. The default remains lazy loading.
+API NDJSON includes `elapsed_ms` and reference-validation/first-status/completion
+milestones; first status is not first audio. The browser client also measures
+request headers, first event and completion without showing implementation
+metrics in the normal voice workflow.
+
+Validation: 150 backend tests on both machines, nine frontend checks and both
+production builds passed. Model/profile changes and shorter sampling schedules
+still require separate speed, word-error and voice-quality comparisons.
 
 Source CPU recognition smoke: Core Ultra 9 185H, four threads, included 3.904 s
 reference; cold initialization 1.69 s, warm incremental recognition including
 final flush about 0.90 s, first partial after 1.0 s of input. Spoken words matched;
 punctuation differed. GPU ASR was checked with mocks and import/API validation
 only; measure recording-to-partial latency and peak VRAM on the receiving GPU.
+
+### Vocoder-only SOAR compilation on the tested RTX 3050
+
+`T1000_TTS_COMPILE_VOCODER=1` enables the isolated convolutional decoder compiler in the eager NF4 `low-vram` profile. It disables CUDA graphs and leaves SOAR sampling, FP32 vocoder parameters, reference processing and configured buffering unchanged (benchmarked at ten steps and four-patch buffering). Compilation and a throwaway buffered stream warm during runtime loading; use `T1000_PRELOAD_MODELS=1` so this finishes before the API becomes ready. Cold compiler warmup can add tens of seconds; warm generation measurements exclude it. Other profiles reject this opt-in rather than silently changing behavior.
+
+```bash
+T1000_TTS_PROFILE=low-vram T1000_TTS_OPTIMIZE=0 T1000_TTS_VOCODER_BATCH_SIZE=4 T1000_TTS_COMPILE_VOCODER=1 T1000_PRELOAD_MODELS=1 .venv/bin/python -m t1000
+```
+
+The default remains `0`; disabling the flag and restarting restores the previous eager vocoder. The ordered native-LSTM, compiler, rotary-reuse, decoder-precision and batch-eight experiments and paired listening evidence are saved in `data/output/3050-soar-optimizations/`. Experimental adapters stay off unless explicitly selected by the benchmark runner; production enables only the compiler flag.

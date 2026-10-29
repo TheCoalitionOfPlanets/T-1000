@@ -64,6 +64,74 @@ test("generation sends settings, stays cancellable, and presents resulting audio
   await expect(page.locator(".output-panel audio")).toHaveAttribute("src", /\/api\/audio\/generated$/)
 })
 
+test("number expansion is reviewed, applied, undone, and cancelled explicitly", async ({ page }) => {
+  await ready(page)
+  const original = "Pay $12.50."
+  const expanded = "Pay twelve point five dollars."
+  await page.getByLabel("Text to speak").fill(original)
+  await page.route("**/api/text/normalize", route => {
+    expect(route.request().postDataJSON()).toEqual({ text: original })
+    return route.fulfill({ json: { text: expanded } })
+  })
+  await page.getByRole("button", { name: "Expand numbers", exact: true }).click()
+  await expect(page.getByRole("region", { name: "Spoken text preview" })).toContainText(expanded)
+  await expect(page.getByLabel("Text to speak")).toHaveValue(original)
+  await expect(page.getByLabel("Reference transcript")).toHaveValue(example.transcript)
+  await expect(page.getByRole("button", { name: "Generate speech" })).toBeDisabled()
+  await page.getByRole("button", { name: "Apply", exact: true }).click()
+  await expect(page.getByLabel("Text to speak")).toHaveValue(expanded)
+  await expect(page.getByRole("button", { name: "Generate speech" })).toBeEnabled()
+  await page.getByRole("button", { name: "Undo expansion" }).click()
+  await expect(page.getByLabel("Text to speak")).toHaveValue(original)
+  await page.getByRole("button", { name: "Expand numbers", exact: true }).click()
+  await expect(page.getByRole("region", { name: "Spoken text preview" })).toBeVisible()
+  await page.getByRole("button", { name: "Cancel", exact: true }).click()
+  await expect(page.getByRole("region", { name: "Spoken text preview" })).toHaveCount(0)
+  await expect(page.getByLabel("Text to speak")).toHaveValue(original)
+  await expect(page.getByRole("button", { name: "Generate speech" })).toBeEnabled()
+})
+
+test("editing text invalidates a pending expansion and ignores its late response", async ({ page }) => {
+  await ready(page)
+  let release!: () => void
+  const pending = new Promise<void>(resolve => { release = resolve })
+  let requested = false
+  await page.route("**/api/text/normalize", async route => {
+    requested = true
+    await pending
+    await route.fulfill({ json: { text: "Old expanded text." } }).catch(() => {})
+  })
+  await page.getByLabel("Text to speak").fill("Pay $12.")
+  await page.getByRole("button", { name: "Expand numbers", exact: true }).click()
+  await expect.poll(() => requested).toBe(true)
+  await expect(page.getByRole("button", { name: "Generate speech" })).toBeDisabled()
+  await page.getByLabel("Text to speak").fill("My newly edited words.")
+  release()
+  await expect(page.getByRole("button", { name: "Generate speech" })).toBeEnabled()
+  await expect(page.getByRole("button", { name: "Expand numbers", exact: true })).toBeEnabled()
+  await expect(page.getByRole("region", { name: "Spoken text preview" })).toHaveCount(0)
+  await expect(page.getByLabel("Text to speak")).toHaveValue("My newly edited words.")
+  await expect(page.getByRole("alert")).toHaveCount(0)
+})
+
+test("an overlong expansion preserves the original and mobile preview fits", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  await ready(page)
+  await page.getByLabel("Text to speak").fill("123")
+  await page.route("**/api/text/normalize", route => route.fulfill({ status: 400, json: { detail: "Expanded text has 151 characters; shorten the original to fit the 150-character limit." } }))
+  await page.getByRole("button", { name: "Expand numbers", exact: true }).click()
+  await expect(page.getByRole("alert")).toContainText("150-character limit")
+  await expect(page.getByLabel("Text to speak")).toHaveValue("123")
+  await expect(page.getByRole("button", { name: "Generate speech" })).toBeEnabled()
+  await page.unroute("**/api/text/normalize")
+  await page.route("**/api/text/normalize", route => route.fulfill({ json: { text: "One hundred twenty three." } }))
+  await page.getByRole("button", { name: "Expand numbers", exact: true }).click()
+  await expect(page.getByRole("region", { name: "Spoken text preview" })).toBeVisible()
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
+  const preview = page.getByRole("region", { name: "Spoken text preview" })
+  expect(await preview.evaluate(element => element.getBoundingClientRect().right <= window.innerWidth)).toBe(true)
+})
+
 test("a missing configuration can be retried without reloading", async ({ page }) => {
   await mockAudio(page)
   let attempts = 0

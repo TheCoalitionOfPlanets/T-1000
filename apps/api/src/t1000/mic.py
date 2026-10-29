@@ -8,9 +8,11 @@ audio frame safe without trusting browser-supplied local file paths.
 import asyncio
 import base64
 import binascii
+import hashlib
 import secrets
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -26,6 +28,8 @@ STATIC = Path(__file__).resolve().parent / "static"
 RECORDING_DIR = CACHE / "recordings"
 SESSION_TTL = 15 * 60
 MAX_SESSIONS = 16
+MAX_COMPLETED_RESULTS = 64
+MAX_PREVIEW_CHUNKS = 4096
 MANUAL_STATUS = "Automatic transcription is unavailable. Enter the recording’s words below."
 
 
@@ -42,6 +46,8 @@ class _Recording:
     cancelled: bool = False
     closed: bool = False
     result: tuple | None = None
+    final_digest: bytes | None = None
+    published: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -51,6 +57,10 @@ class RecorderService:
             raise ValueError("Recording limit must be between 0 and 180 seconds.")
         self.max_seconds = float(max_seconds)
         self._recordings = {}
+        # Final HTTP responses can be lost after ASR has finished. Keep a small
+        # result ledger separately from active recognition sessions so retries
+        # can recover the exact recording without using an active slot.
+        self._completed = OrderedDict()
         self._lock = threading.Lock()
 
     @staticmethod
@@ -74,14 +84,22 @@ class RecorderService:
         with entry.lock:
             self._close_session(entry)
             entry.chunks.clear()
-            if entry.result and entry.result[0]:
+            if not entry.published and entry.result and entry.result[0]:
                 Path(entry.result[0]).unlink(missing_ok=True)
 
     def _get(self, token):
         if not isinstance(token, str):
             raise ValueError("Invalid recording token.")
+        expired = None
         with self._lock:
-            entry = self._recordings.get(token)
+            entry = self._recordings.get(token) or self._completed.get(token)
+            if entry is not None and time.monotonic() - entry.updated > SESSION_TTL:
+                self._recordings.pop(token, None)
+                self._completed.pop(token, None)
+                entry.cancelled = True
+                expired = entry
+        if expired is not None:
+            self._discard_entry(expired)
         if entry is None or entry.cancelled:
             raise ValueError("This recording expired. Start a new recording.")
         return entry
@@ -105,11 +123,12 @@ class RecorderService:
         now = time.monotonic()
         expired = []
         with self._lock:
-            for token, entry in list(self._recordings.items()):
-                if now - entry.updated > SESSION_TTL:
-                    entry.cancelled = True
-                    self._recordings.pop(token)
-                    expired.append(entry)
+            for registry in (self._recordings, self._completed):
+                for token, entry in list(registry.items()):
+                    if now - entry.updated > SESSION_TTL:
+                        entry.cancelled = True
+                        registry.pop(token)
+                        expired.append(entry)
         for entry in expired:
             self._discard_entry(entry)
         with self._lock:
@@ -125,13 +144,25 @@ class RecorderService:
         sequence = data.get("sequence")
         if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
             raise ValueError("Invalid microphone sequence.")
+        if not raw:
+            raise ValueError("The microphone audio chunk is empty.")
         with entry.lock:
             if entry.cancelled or entry.result is not None:
                 return {"cancelled": True}
             if sequence < entry.sequence:
-                return {"sequence": entry.sequence, "text": entry.session.text}
+                if raw != entry.chunks[sequence]:
+                    raise ValueError("A microphone retry changed an acknowledged audio chunk.")
+                entry.updated = time.monotonic()
+                return {
+                    "sequence": entry.sequence,
+                    "sample_count": entry.sample_count,
+                    "text": "" if entry.failed else entry.session.text,
+                    "cancelled": entry.cancelled,
+                }
             if sequence != entry.sequence:
                 raise ValueError("Microphone audio arrived out of order.")
+            if sequence >= MAX_PREVIEW_CHUNKS:
+                raise ValueError("Too many live microphone chunks. Finish with the complete recording.")
             count = len(raw) // 2
             if entry.sample_count + count > int(self.max_seconds * entry.sample_rate):
                 raise ValueError("The recording exceeds the recording limit.")
@@ -149,6 +180,7 @@ class RecorderService:
                     self._close_session(entry)
             return {
                 "sequence": entry.sequence,
+                "sample_count": entry.sample_count,
                 "text": "" if entry.failed else entry.session.text,
                 "status": f"{entry.error_reason} {MANUAL_STATUS}".strip() if entry.failed else "Listening…",
                 "cancelled": entry.cancelled,
@@ -158,13 +190,18 @@ class RecorderService:
         token = data.get("token")
         entry = self._get(token)
         raw = self._pcm(data.get("pcm"), entry.sample_rate)
+        digest = hashlib.sha256(raw).digest()
         with entry.lock:
             if entry.cancelled:
                 return {"cancelled": True}
             if entry.result is not None:
+                if digest != entry.final_digest:
+                    raise ValueError("A final recording retry changed the saved audio. Start a new recording.")
                 return {"token": token}
             if not raw:
                 raise ValueError("The recording is empty. Record a clear sentence.")
+            if len(raw) // 2 < entry.sample_count:
+                raise ValueError("The complete recording is missing acknowledged audio. Retry with the complete recording.")
             RECORDING_DIR.mkdir(parents=True, exist_ok=True)
             path = RECORDING_DIR / f"recording-{token}.wav"
             sf.write(path, np.frombuffer(raw, dtype="<i2"), entry.sample_rate, subtype="PCM_16")
@@ -175,10 +212,20 @@ class RecorderService:
                     self._close_session(entry)
                     text = transcribe_file(str(path), max_seconds=self.max_seconds)
                 else:
-                    tail = raw[len(streamed):]
-                    if tail:
-                        entry.session.feed(entry.sample_rate, np.frombuffer(tail, dtype="<i2"))
-                    text = entry.session.finish()
+                    try:
+                        tail = raw[len(streamed):]
+                        if tail:
+                            entry.session.feed(entry.sample_rate, np.frombuffer(tail, dtype="<i2"))
+                        text = entry.session.finish()
+                    except Exception as exc:
+                        # A preview decoder can fail while flushing its last
+                        # frames. The saved complete recording is authoritative;
+                        # retry it in a fresh recognizer rather than publishing
+                        # the earlier partial transcript or losing the tail.
+                        if isinstance(exc, STTError):
+                            entry.error_reason = str(exc)
+                        self._close_session(entry)
+                        text = transcribe_file(str(path), max_seconds=self.max_seconds)
                 text = text.strip()
             except Exception as exc:
                 # Preserve usable audio even when the optional ASR model is missing.
@@ -190,18 +237,35 @@ class RecorderService:
                 path.unlink(missing_ok=True)
                 return {"cancelled": True}
             entry.result = (str(path), text, status)
+            entry.final_digest = digest
             entry.chunks.clear()
             entry.updated = time.monotonic()
             return {"token": token}
 
-    def consume(self, token):
+    def consume(self, token, *, retain=False):
+        """Publish a complete result; HTTP callers can retain it for retries.
+
+        The published WAV belongs to its caller, so expiry/eviction of the
+        retry ledger never deletes it. Legacy Gradio consumption still removes
+        the token immediately unless ``retain=True`` is explicitly requested.
+        """
         entry = self._get(token)
         with entry.lock:
             if entry.result is None or entry.cancelled:
                 raise ValueError("The recording has not finished.")
             self._close_session(entry)
             with self._lock:
+                if entry.cancelled:
+                    raise ValueError("The recording was cancelled before publication.")
+                entry.published = True
                 self._recordings.pop(token, None)
+                if retain:
+                    self._completed[token] = entry
+                    self._completed.move_to_end(token)
+                    while len(self._completed) > MAX_COMPLETED_RESULTS:
+                        self._completed.popitem(last=False)
+                else:
+                    self._completed.pop(token, None)
             return entry.result
 
     async def start(self, data):
@@ -216,6 +280,7 @@ class RecorderService:
     async def cancel(self, data):
         with self._lock:
             entry = self._recordings.pop(data.get("token"), None)
+            entry = self._completed.pop(data.get("token"), None) or entry
             if entry is not None:
                 entry.cancelled = True
         if entry is not None:

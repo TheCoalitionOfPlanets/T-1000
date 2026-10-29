@@ -49,7 +49,7 @@ T-1000 is a local voice studio for experimenting with English speech synthesis a
 | **System tools** | Git, FFmpeg, and libsndfile. |
 | **Browser** | A current browser with AudioWorklet; microphone access requires localhost or HTTPS. |
 | **Storage** | About 5.2 GB for SOAR and 662 MB for the CPU recognizer, plus dependencies and caches. |
-| **Optional GPU** | NVIDIA CUDA with a compatible PyTorch build; BF16 where supported, otherwise FP16. Minimum VRAM has not been verified; see [setup](docs/setup.md). |
+| **Optional GPU** | NVIDIA CUDA with a compatible PyTorch build; BF16 where supported, otherwise FP16. NF4 inference tested on a 4 GB RTX 3050 Laptop GPU; see [measurements and limits](docs/setup.md#rtx-3050-validation--2026-10-28). |
 
 ## Installation
 
@@ -188,6 +188,7 @@ Nemotron consumes each audio chunk once. The optional Whisper backend makes buff
 | `T1000_ROOT` | Override the runtime root when using the Python package outside its checkout. |
 | `T1000_TTS_PROFILE` | `auto` by default: experimental `low-vram` on CUDA GPUs with 6 GiB or less; otherwise `standard`. Set `offload` for CPU-backed language-model layers. |
 | `T1000_TTS_OPTIMIZE` | `auto` by default: compile standard CUDA inference on GPUs with at least 12 GiB. `0` disables compilation; `1` explicitly enables it in the standard profile. Low-memory profiles stay eager. |
+| `T1000_TTS_COMPILE_VOCODER` | `0` by default. Set `1` for the tested vocoder-only compiler on eager `low-vram` CUDA. Warms during runtime loading; leaves SOAR sampling, FP32 vocoder precision and configured buffering unchanged. Combine with `T1000_PRELOAD_MODELS=1` to finish warmup before readiness. |
 | `T1000_TTS_GPU_LAYERS` | Offload profile only: number of Qwen blocks kept on GPU, default `0`. `14` keeps half its 28 decoder blocks resident, with a higher VRAM cost. |
 | `HF_HUB_OFFLINE` | Defaults to `1` in the app; explicit Hugging Face download commands use `0`. |
 | `GRADIO_ANALYTICS_ENABLED` | Defaults to `False`. |
@@ -344,9 +345,11 @@ Try the bundled voice and one short English sentence. Check that your own refere
 ## Limitations
 
 - This interface supports English inference; training and fine-tuning are not implemented.
-- CPU requests allow 150 text characters and references up to 10 seconds. Standard CUDA requests allow 500 characters and 30-second references; experimental low-memory profiles allow 150 characters and 6-second references. References must be at least one second; uploads are capped at 32 MB.
-- Generation has a 600-second budget. Cancellation waits for the current compute step.
-- Real GPU synthesis, combined TTS/ASR memory use, and minimum VRAM remain unverified on the receiving machine.
+- Requests accept up to 5,000 text characters, including multiple paragraphs. Longer passages use sentence-aware parts of up to 150 characters on CPU and low-memory GPU profiles, or 500 on standard CUDA. Every part uses the same reference, and one WAV contains the complete result. References remain limited to 10 seconds on CPU, 30 seconds on standard CUDA and 6 seconds on low-memory profiles. References must be at least one second; uploads are capped at 32 MB.
+- Generation has a 600-second budget for one part or 1,800 seconds for multiple parts, with a maximum of 10 minutes of output audio. Cancellation finishes the current compute step and saves an explicitly incomplete result; it does not silently skip remaining text.
+- Real CUDA synthesis and CPU recognition pass on a 4 GB RTX 3050 Laptop GPU with
+  the low-memory profile. See [the hardware record](docs/setup.md#rtx-3050-validation--2026-10-28)
+  for measured latency; combined CUDA TTS/ASR and other GPUs still need testing.
 - The previous CPU smoke run produced 1.92 seconds of audio in about 94 seconds, including model loading, on an Intel Core Ultra 9 185H. This is one sample, not a performance benchmark.
 
 ## Documentation

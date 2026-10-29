@@ -9,9 +9,9 @@ import gradio as gr
 def build_app():
     with gr.Blocks(title="T-1000 · English Voice Lab") as demo:
         reference_state = gr.State(voice.ReferenceState())
-        gr.Markdown("# English Voice Lab\nTest dots.tts SOAR locally. Enter a short sentence and press **Generate speech**.")
+        gr.Markdown(f"# English Voice Lab\nEnter a sentence or a few paragraphs (up to {voice.TEXT_LIMIT:,} characters), then press **Generate speech**.")
         if voice.DEVICE == "CPU":
-            gr.Markdown(f"Running on **CPU**. Synthesis can take several minutes. Start with one short sentence (up to 150 characters). Generation time limit: **{voice.GENERATION_TIMEOUT / 60:g} minutes**.")
+            gr.Markdown(f"Running on **CPU**. Start with one short sentence; longer passages can take several minutes. Generation has a {voice.GENERATION_TIMEOUT / 60:g}-minute budget for one part and {voice.PARAGRAPH_TIMEOUT / 60:g} minutes for multiple parts. Stop saves any completed audio.")
         with gr.Row():
             with gr.Column():
                 text = gr.Textbox(

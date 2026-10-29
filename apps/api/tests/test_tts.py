@@ -33,7 +33,7 @@ class RuntimeLoadingTests(unittest.TestCase):
 
     def load(self, *, cuda, optimization=None):
         warmup = Mock(side_effect=lambda: self.assertTrue(torch.is_inference_mode_enabled()))
-        runtime = SimpleNamespace(device=SimpleNamespace(type="cuda" if cuda else "cpu"), run_warmup=warmup)
+        runtime = SimpleNamespace(device=SimpleNamespace(type="cuda" if cuda else "cpu"), run_warmup=warmup, sample_rate=48000)
         create = Mock(return_value=runtime)
         module = SimpleNamespace(DotsTtsRuntime=SimpleNamespace(from_pretrained=create))
         with tempfile.TemporaryDirectory() as directory:
@@ -45,12 +45,13 @@ class RuntimeLoadingTests(unittest.TestCase):
                     patch.object(torch.cuda, "is_available", return_value=cuda), \
                     patch.object(torch.cuda, "get_device_properties", return_value=SimpleNamespace(total_memory=24 * 2**30)), \
                     patch.object(torch.cuda, "is_bf16_supported", return_value=True):
-                for key in ("T1000_TTS_OPTIMIZE", "T1000_TTS_PROFILE", "T1000_TTS_GPU_LAYERS"):
+                for key in ("T1000_TTS_OPTIMIZE", "T1000_TTS_PROFILE", "T1000_TTS_GPU_LAYERS", "T1000_TTS_EAGER_CACHE"):
                     os.environ.pop(key, None)
                 if optimization is not None:
                     os.environ["T1000_TTS_OPTIMIZE"] = optimization
                 self.assertIs(tts.load_runtime(), runtime)
                 self.assertIs(tts.load_runtime(), runtime)
+                self.assertTrue(callable(runtime._load_prompt_audio))
         create.assert_called_once()
         self.assertFalse(create.call_args.kwargs["warmup_on_optimize"])
         self.assertEqual(warmup.call_count, int(create.call_args.kwargs["optimize"]))
@@ -88,13 +89,15 @@ class RuntimeLoadingTests(unittest.TestCase):
                 model_path = Path(directory)
                 (model_path / "model.safetensors").touch()
                 settings = InferenceSettings(profile, "float16", False, 6, 150, 128, gpu_layers=14)
-                runtime = object()
+                runtime = SimpleNamespace(sample_rate=48000)
                 with patch.object(tts, "MODEL_PATH", model_path), \
                         patch.object(tts, "get_inference_settings", return_value=settings), \
-                        patch(target, return_value=runtime) as loader:
+                        patch(target, return_value=runtime) as loader, \
+                        patch.dict(os.environ, {"T1000_TTS_EAGER_CACHE": "0"}):
                     self.assertIs(tts.load_runtime(), runtime)
                     self.assertIs(tts.load_runtime(), runtime)
                 loader.assert_called_once_with(model_path, **expected)
+                self.assertTrue(callable(runtime._load_prompt_audio))
 
 
 class InferenceControlsTests(unittest.TestCase):

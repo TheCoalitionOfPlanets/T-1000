@@ -175,6 +175,18 @@ class StreamingTranscriptionTests(unittest.TestCase):
         self.assertEqual(np.count_nonzero(accepted), 8000)
         self.assertEqual(self.recognizer.streams[0].finished_calls, 1)
 
+    def test_overlong_file_is_rejected_without_a_silently_truncated_transcript(self):
+        session = Mock(limit_reached=False)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "speech.wav"
+            sf.write(path, np.full(2400, 0.25, dtype=np.float32), 16000)
+            with patch.object(stt, "create_session", return_value=session):
+                with self.assertRaisesRegex(stt.STTError, "truncated transcript was not produced"):
+                    stt.transcribe_file(path, max_seconds=.1)
+        session.feed.assert_not_called()
+        session.finish.assert_not_called()
+        session.close.assert_called_once()
+
 
 class RecognizerLoadingTests(unittest.TestCase):
     def test_missing_model_has_an_actionable_error(self):

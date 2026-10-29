@@ -111,6 +111,7 @@ def load_offloaded_runtime(model_path, *, precision, gpu_layers=0):
         ) from exc
 
     from dots_tts.models.dots_tts.model import DotsTtsModel
+    from dots_tts.modules.backbone.dit_inference import fuse_dit_for_inference
     from dots_tts.runtime import DotsTtsRuntime
 
     model_path = Path(model_path)
@@ -119,6 +120,9 @@ def load_offloaded_runtime(model_path, *, precision, gpu_layers=0):
     with torch.inference_mode(False):
         with torch.device("cpu"):
             model = DotsTtsModel.from_pretrained(model_path)
+            # Avoid the first decode's temporary CUDA copies of the original
+            # and fused acoustic weights; only the final adapter moves to CUDA.
+            fuse_dit_for_inference(model.core)
             model = _OffloadedModel(
                 model, gpu_layers=gpu_layers, cpu_offload=cpu_offload
             )
