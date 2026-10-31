@@ -145,8 +145,9 @@ class FlowAPITests(unittest.TestCase):
             changed=self.client.post('/api/recordings/finish',json={**data,'pcm':base64.b64encode(pcm[:-2]).decode()})
             self.assertEqual(changed.status_code,400)
             self.assertEqual(session.finalized,1)
-            raw=self.client.get(first.json()['url']).content
+            raw=self.client.get(first.json()['original_url']).content
             self.assertEqual(sf.read(io.BytesIO(raw),dtype='int16')[0].tobytes(),pcm)
+            self.assertNotEqual(first.json()['url'], first.json()['original_url'])
             self.client.post('/api/recordings/cancel',json={'token':token})
             self.assertEqual(self.client.post('/api/recordings/finish',json=data).status_code,400)
             self.assertEqual(self.client.get(first.json()['url']).status_code,200)

@@ -3,6 +3,12 @@ export interface Reference {
   url: string
   transcript: string
   status: string
+  duration_seconds?: number
+  original_id?: string
+  original_url?: string
+  original_duration_seconds?: number
+  noise_reduction?: boolean
+  auto_trim?: boolean
 }
 
 export interface Config {

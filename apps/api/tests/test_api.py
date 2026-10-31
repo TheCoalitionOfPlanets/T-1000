@@ -282,7 +282,7 @@ class APITests(unittest.TestCase):
         pcm = (np.sin(np.arange(32000) * .05) * 6000).astype("<i2").tobytes()
         service = transport.RecorderService(10)
         with patch.object(api, "recorder", service), patch.object(transport, "RECORDING_DIR", self.root), patch.object(transport, "create_session", return_value=session):
-            started = self.client.post("/api/recordings/start", json={"sample_rate": 16000}).json()
+            started = self.client.post("/api/recordings/start", json={"sample_rate": 16000, "noise_reduction": False}).json()
             fed = self.client.post("/api/recordings/feed", json={"token": started["token"], "sequence": 0, "pcm": base64.b64encode(pcm[:16000]).decode()})
             self.assertEqual(fed.json()["text"], "Partial words")
             finished = self.client.post("/api/recordings/finish", json={"token": started["token"], "pcm": base64.b64encode(pcm).decode()})

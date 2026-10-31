@@ -5,6 +5,7 @@ import { LiveWaveform } from "@/components/elevenlabs/live-waveform"
 import { Button } from "@/components/ui/button"
 import { downloadVerifiedAudio, generate, post, request, type Config, type Reference, type GenerationUpdate } from "@/lib/api"
 import { VoiceRecorder } from "@/lib/recorder"
+import { ReferenceEditor, type ReferenceEdits } from "@/components/reference-editor"
 
 const phrases = [
   { name: "A warm welcome", text: "Welcome. Make yourself comfortable. I have a feeling we're going to create something wonderful." },
@@ -84,6 +85,10 @@ export default function App() {
   const [normalizationError, setNormalizationError] = useState("")
   const [originalText, setOriginalText] = useState<string | null>(null)
   const [reference, setReference] = useState<Reference | null>(null)
+  const [referenceSource, setReferenceSource] = useState<Reference | null>(null)
+  const [referenceEditVersion, setReferenceEditVersion] = useState(0)
+  const [referenceEditPending, setReferenceEditPending] = useState(false)
+  const [captureNoiseReduction, setCaptureNoiseReduction] = useState(true)
   const [referenceName, setReferenceName] = useState("Example voice")
   const [transcript, setTranscript] = useState("")
   const [referenceStatus, setReferenceStatus] = useState("Choose an example, record your voice, or upload a clip.")
@@ -115,12 +120,23 @@ export default function App() {
   const fileInput = useRef<HTMLInputElement>(null)
   const textInput = useRef<HTMLTextAreaElement>(null)
 
+  function selectReference(selected: Reference) {
+    setReference(selected)
+    setReferenceSource({ ...selected, id: selected.original_id ?? selected.id,
+      url: selected.original_url ?? selected.url,
+      duration_seconds: selected.original_duration_seconds ?? selected.duration_seconds })
+    setReferenceEditVersion(previous => previous + 1)
+    setReferenceEditPending(false)
+    setTranscript(selected.transcript)
+    setReferenceStatus(selected.status)
+  }
+
   async function connect() {
     setConnectionError("")
     try {
       const data = await request<Config>("/api/config")
       setConfig(data)
-      if (data.example) { setReference(data.example); setTranscript(data.example.transcript); setReferenceStatus("Example voice ready. Make it your own, or start creating.") }
+      if (data.example) { selectReference(data.example); setReferenceStatus("Example voice ready. Make it your own, or start creating.") }
       setResult(data.sample_url)
     } catch { setConnectionError("Could not connect to the local server. Start the local API and try again.") }
   }
@@ -147,7 +163,7 @@ export default function App() {
 
   const referenceLocked = busy || referenceBusy || recording || canResume
   const validSeed = /^\d+$/.test(seed) && Number(seed) <= 4294967295
-  const canGenerate = !!config && !!reference && !!text.trim() && !!transcript.trim() && text.length <= config.text_limit && validSeed && !referenceLocked && !normalizing && !textPreview
+  const canGenerate = !!config && !!reference && !!text.trim() && !!transcript.trim() && text.length <= config.text_limit && validSeed && !referenceLocked && !referenceEditPending && !normalizing && !textPreview
 
   function cancelExpansion() {
     normalizationVersion.current++
@@ -193,7 +209,7 @@ export default function App() {
   function useExample() {
     recoveryFile.current = null; setRecoveredRecording(null)
     if (!config?.example) return
-    setReference(config.example)
+    selectReference(config.example)
     setReferenceName("Example voice")
     setTranscript(config.example.transcript)
     setReferenceError("")
@@ -204,6 +220,8 @@ export default function App() {
     if (!file || referenceLocked) return
     if (file !== recoveryFile.current) { recoveryFile.current = null; setRecoveredRecording(null) }
     setReference(null)
+    setReferenceSource(null)
+    setReferenceEditPending(false)
     setTranscript("")
     setReferenceError("")
     if (file.size > 32 * 1024 * 1024) { setReferenceError("Choose an audio file smaller than 32 MB."); return }
@@ -212,9 +230,10 @@ export default function App() {
     referenceController.current = new AbortController()
     const data = new FormData()
     data.append("file", file)
+    data.append("noise_reduction", String(captureNoiseReduction))
     try {
       const selected = await request<Reference>("/api/reference", { method: "POST", body: data, signal: referenceController.current.signal })
-      setReference(selected)
+      selectReference(selected)
       setReferenceName(file.name)
       setTranscript(selected.transcript)
       setReferenceStatus(selected.status)
@@ -226,6 +245,8 @@ export default function App() {
   function record() {
     recoveryFile.current = null; setRecoveredRecording(null)
     setReference(null)
+    setReferenceSource(null)
+    setReferenceEditPending(false)
     setTranscript("")
     setPreview("")
     setReferenceError("")
@@ -236,10 +257,10 @@ export default function App() {
       onFinishing: () => setReferenceBusy(true),
       onProgress: (seconds, words) => { setRecordedSeconds(seconds); setPreview(words) },
       onStatus: setReferenceStatus,
-      onComplete: selected => { setReference(selected); setReferenceName("My recorded voice"); setTranscript(selected.transcript); setReferenceStatus(selected.status); setRecording(false); setReferenceBusy(false); recorder.current = null },
+      onComplete: selected => { selectReference(selected); setReferenceName("My recorded voice"); setRecording(false); setReferenceBusy(false); recorder.current = null },
       onRecovery: (file, message) => { recoveryFile.current = file; setRecoveredRecording(file); setReferenceStatus(message) },
       onError: message => { setReferenceError(message); setReferenceStatus(recoveryFile.current ? "Your complete recording is held in this tab. Download it before closing, or retry the upload." : "Record again, upload audio, or use the example voice."); setRecording(false); setReferenceBusy(false); recorder.current = null },
-    })
+    }, captureNoiseReduction)
     void recorder.current.start()
   }
 
@@ -254,6 +275,30 @@ export default function App() {
     setRecording(false)
     setReferenceBusy(false)
     setReferenceStatus("Recording discarded. Record again or choose the example voice.")
+  }
+
+  async function applyReferenceEdits(edits: ReferenceEdits) {
+    if (!referenceSource || referenceLocked) return false
+    setReferenceBusy(true)
+    setReferenceError("")
+    setReferenceStatus("Applying voice edits and updating the transcript…")
+    const controller = new AbortController()
+    referenceController.current = controller
+    try {
+      const selected = await post<Reference>("/api/reference/process", { reference_id: referenceSource.id, ...edits }, controller.signal)
+      if (controller.signal.aborted) return false
+      setReference(selected)
+      setTranscript(selected.transcript)
+      setReferenceStatus(selected.status)
+      setReferenceEditPending(false)
+      return true
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        setReferenceError(error instanceof Error ? error.message : "The voice edits could not be applied.")
+        setReferenceStatus("Your previous voice is still selected. Adjust the edits and try again.")
+      }
+      return false
+    } finally { setReferenceBusy(false); if (referenceController.current === controller) referenceController.current = null }
   }
 
   async function runGeneration(payload: NonNullable<typeof pendingGeneration.current>) {
@@ -379,6 +424,8 @@ export default function App() {
                 {recording && <div className="recording-view"><div className="recording-indicator"><span className="activity-dot" />{stream ? "Recording" : referenceBusy ? "Finishing" : "Connecting microphone"}<span>{recordedSeconds.toFixed(1)}s / {config?.reference_limit}s</span></div><LiveWaveform stream={stream} active={!!stream} processing={referenceBusy} height={56} barColor="#171717" barWidth={3} barGap={3} /><p className="live-preview">{preview || "Your words will appear here as you speak…"}</p></div>}
                 <div className="reference-actions">{recording ? <><Button variant="outline" className="finish-recording" disabled={!stream || referenceBusy} onClick={() => void finishRecording()}><Square size={13} fill="currentColor" />Finish recording</Button><Button variant="ghost" size="icon" aria-label="Discard recording" onClick={() => void cancelRecording()}><X size={16} /></Button></> : <><Button variant="outline" disabled={!config || referenceLocked} onClick={record}><Mic size={15} />Record voice</Button><Button variant="outline" disabled={!config || referenceLocked} onClick={() => fileInput.current?.click()}><Upload size={15} />Upload audio</Button></>}</div>
                 <input ref={fileInput} type="file" accept="audio/*,.wav,.flac,.mp3,.ogg,.m4a" className="sr-only" aria-label="Upload reference audio" onChange={event => void upload(event.target.files?.[0])} disabled={referenceLocked} />
+                <label className="cleanup-option capture-cleanup"><input type="checkbox" checked={captureNoiseReduction} disabled={referenceLocked} onChange={event => setCaptureNoiseReduction(event.target.checked)} /><span>Reduce background noise on recording and upload</span></label>
+                {reference && referenceSource && <ReferenceEditor key={`${referenceSource.id}-${referenceEditVersion}`} source={referenceSource} disabled={referenceLocked} onApply={applyReferenceEdits} onPendingChange={setReferenceEditPending} />}
                 <div className="reference-note" role="status" aria-live="polite">{referenceBusy && <LoaderCircle size={12} className="spin" />}<span>{referenceStatus}</span></div>
                 {referenceError && <p className="field-error" role="alert">{referenceError}</p>}
                 {recoveryUrl && recoveredRecording && <div className="text-tools"><a className="download-link" href={recoveryUrl} download="my-voice-recording.wav">Download recording</a><Button variant="outline" size="sm" disabled={referenceBusy} onClick={() => void upload(recoveredRecording)}>Retry recording upload</Button></div>}

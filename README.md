@@ -139,6 +139,12 @@ The first generation also loads the speech model. CPU synthesis can take several
 
 To use your own voice, click **Record voice**, speak a clear 3–6 second sentence, and click **Finish recording**. You can also choose **Upload audio**. Review the editable **Reference transcript** so its words match the recording exactly, then generate your new text. **Use example voice** restores the bundled reference and matching transcript.
 
+**Reduce background noise on recording and upload** is enabled by default. Microphone capture requests browser noise suppression and echo cancellation where supported; saved references also receive gentle local cleanup for steady hiss, hum and rumble. Turn it off to keep the captured sound. Cleanup preserves the native sample rate and does not require another model or GPU.
+
+Open **Clean up and trim voice** to remove unwanted audio from the beginning or end. Set the start/end in seconds or use the sliders, and use **Preview selection** to hear that range of the original. Choose noise reduction and optional automatic quiet-edge trimming, then click **Apply voice edits**. Listen to the edited clip in the voice player and check its refreshed transcript before generating. Keep at least one second of speech within the current reference limit. **Restore original** returns to the full captured/uploaded recording; each edit starts from that original so repeated edits do not stack filters. Overlapping voices, music and strong room echo may remain after cleanup.
+
+The optional Gradio interface has equivalent controls under **Clean up and crop the reference**; click **Apply cleanup and crop** after recording or uploading. Crop times always refer to the original recording.
+
 **Stop generation** requests cancellation after the current audio step. If audio has already been produced, it is saved as partial output. If automatic transcription fails, a valid recording remains available so you can enter its words manually.
 
 ### Commands
@@ -286,7 +292,7 @@ npm run test:web
 git diff --check
 ```
 
-The suite currently contains 109 Python tests and six browser checks. Full speech inference is mocked in regression tests; optional bitsandbytes and Accelerate tests exercise small real Qwen models. Browser checks exercise the real microphone worklet with a test clip. For another API port, set `PLAYWRIGHT_BASE_URL`, for example `http://127.0.0.1:7861`.
+The suite currently contains 283 Python tests and 60 browser checks. Full speech inference is mocked in regression tests; optional bitsandbytes and Accelerate tests exercise small real Qwen models. Browser checks exercise the real microphone worklet with a test clip. For another API port, set `PLAYWRIGHT_BASE_URL`, for example `http://127.0.0.1:7861`.
 
 ## Troubleshooting
 

@@ -37,6 +37,7 @@ MANUAL_STATUS = "Automatic transcription is unavailable. Enter the recording’s
 class _Recording:
     sample_rate: int
     session: object
+    noise_reduction: bool = True
     updated: float = field(default_factory=time.monotonic)
     sequence: int = 0
     chunks: list = field(default_factory=list)
@@ -120,6 +121,9 @@ class RecorderService:
         rate = data.get("sample_rate")
         if isinstance(rate, bool) or not isinstance(rate, int) or not 8000 <= rate <= 192000:
             raise ValueError("Unsupported microphone sample rate.")
+        noise_reduction = data.get("noise_reduction", True)
+        if not isinstance(noise_reduction, bool):
+            raise ValueError("Noise reduction must be enabled or disabled.")
         now = time.monotonic()
         expired = []
         with self._lock:
@@ -135,7 +139,7 @@ class RecorderService:
             if len(self._recordings) >= MAX_SESSIONS:
                 raise ValueError("Too many active recordings. Finish or cancel a recording first.")
             token = secrets.token_urlsafe(32)
-            self._recordings[token] = _Recording(rate, create_session(max_seconds=self.max_seconds))
+            self._recordings[token] = _Recording(rate, create_session(max_seconds=self.max_seconds), noise_reduction=noise_reduction)
         return {"token": token, "max_seconds": self.max_seconds}
 
     def _feed(self, data):
@@ -267,6 +271,10 @@ class RecorderService:
                 else:
                     self._completed.pop(token, None)
             return entry.result
+
+    def cleanup_enabled(self, token):
+        """Return the capture-time preference, also retained for finish retries."""
+        return self._get(token).noise_reduction
 
     async def start(self, data):
         return await asyncio.to_thread(self._start, data)

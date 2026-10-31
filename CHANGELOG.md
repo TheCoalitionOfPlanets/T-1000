@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-10-31 — Reference cleanup and trimming
+
+- Enable browser microphone noise suppression and echo cancellation, with a
+  recording/upload opt-out in the studio. Clean saved references locally with
+  conservative background suppression while preserving their native rate.
+- Add start/end inputs and sliders, range preview, optional automatic quiet-edge
+  trimming, and original restoration. Always edit the original into a new WAV
+  and re-transcribe the exact result before voice generation.
+- Add equivalent cleanup/crop controls to the optional Gradio lab. Keep raw
+  recordings available through recording retries and audio-registry eviction.
+- Cover noise reduction, speech retention, exact crops, invalid selections,
+  transcript consistency, original restoration and browser interactions.
+
+Validation: 283 backend tests, 60 browser checks, and the production build pass.
+A real API/browser smoke verifies microphone capture, upload cleanup, repeated
+crops and restoration with matching WAV frame counts and no browser/API errors.
+Speech recognition is stubbed at its boundary in this smoke; synthesis quality
+and target-GPU inference are not measured by these checks.
+
 ## 2026-10-29 — Paragraph generation
 
 - Raise the full request limit to 5,000 characters and label the editor counter
