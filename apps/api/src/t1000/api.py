@@ -20,7 +20,7 @@ from uuid import uuid4
 
 import anyio
 import soundfile as sf
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
@@ -31,6 +31,7 @@ from .text import expand_english_text
 from .mic import RecorderService
 from .jobs import GenerationJobs, JobBusy, JobConflict, JobNotFound
 from .paths import CACHE, WEB
+from .reference_processing import process_reference
 
 
 LOGGER = logging.getLogger(__name__)
@@ -56,6 +57,8 @@ class AudioFile:
     path: Path
     transcript: str = ""
     status: str = ""
+    original_id: str | None = None
+    original: "AudioFile | None" = None
 
 
 class Payload(BaseModel):
@@ -64,6 +67,15 @@ class Payload(BaseModel):
 
 class RecordingStart(Payload):
     sample_rate: int = Field(strict=True, ge=8000, le=192000)
+    noise_reduction: bool = Field(default=True, strict=True)
+
+
+class ProcessReferenceRequest(Payload):
+    reference_id: str = Field(min_length=1, max_length=64)
+    start_seconds: float = Field(default=0, ge=0, allow_inf_nan=False)
+    end_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    noise_reduction: bool = Field(default=True, strict=True)
+    auto_trim: bool = Field(default=False, strict=True)
 
 
 class RecordingToken(Payload):
@@ -96,15 +108,62 @@ class NormalizeTextRequest(Payload):
     text: str = Field(min_length=1, max_length=TEXT_LIMIT)
 
 
-def _register(path, transcript="", status=""):
+def _register(path, transcript="", status="", *, original_id=None):
     match = re.fullmatch(r"speech-([a-f0-9]{32})\.wav", Path(path).name)
     generated = not transcript and not status and match and Path(path).resolve().is_relative_to(voice.OUTPUT_DIR.resolve())
     audio_id = f"g-{match.group(1)}" if generated else uuid4().hex
+    original = _lookup(original_id) if original_id else None
+    result = {"id": audio_id, "url": f"/api/audio/{audio_id}", "transcript": transcript, "status": status}
+    try:
+        result["duration_seconds"] = sf.info(path).duration
+    except (OSError, RuntimeError):
+        pass
+    if original_id:
+        result.update(original_id=original_id, original_url=f"/api/audio/{original_id}",
+                      original_duration_seconds=sf.info(original.path).duration)
     with audio_lock:
-        audio_files[audio_id] = AudioFile(Path(path), transcript, status)
+        audio_files[audio_id] = AudioFile(Path(path), transcript, status, original_id, original)
         while len(audio_files) > MAX_AUDIO_ENTRIES:
             audio_files.popitem(last=False)
-    return {"id": audio_id, "url": f"/api/audio/{audio_id}", "transcript": transcript, "status": status}
+    return result
+
+
+def _transcribe_reference(path):
+    try:
+        transcript = voice.stt.transcribe_file(str(path), max_seconds=voice.REFERENCE_LIMIT).strip()
+        status = "Recording transcribed. Check the words before generating speech." if transcript else "No speech was recognized. Enter the exact words in the recording."
+    except Exception as exc:
+        LOGGER.warning("Reference transcription failed: %s", exc)
+        transcript = ""
+        status = f"Automatic transcription is unavailable: {exc}. Enter the exact words in the recording."
+    return transcript, status
+
+
+def _processed_reference(path, *, original_id=None, noise_reduction=True,
+                         start_seconds=0, end_seconds=None, auto_trim=False,
+                         original_transcript="", original_status=""):
+    """Publish a new immutable WAV; the transcript always describes this WAV."""
+    samples, rate = _validate_reference(path)
+    try:
+        samples = process_reference(samples, rate, start_seconds=start_seconds,
+                                    end_seconds=end_seconds, noise_reduction=noise_reduction,
+                                    auto_trim=auto_trim)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    target = UPLOAD_DIR / f"reference-{uuid4().hex}.wav"
+    try:
+        sf.write(target, samples, rate, subtype="PCM_16")
+        _validate_reference(target)
+        transcript, status = _transcribe_reference(target)
+        if original_id is None:
+            original_id = _register(path, original_transcript, original_status)["id"]
+        result = _register(target, transcript, status, original_id=original_id)
+        result.update(noise_reduction=noise_reduction, auto_trim=auto_trim)
+        return result
+    except BaseException:
+        target.unlink(missing_ok=True)
+        raise
 
 
 def _lookup(audio_id):
@@ -114,6 +173,11 @@ def _lookup(audio_id):
         return AudioFile(voice.OUTPUT_DIR / "test-english.wav")
     with audio_lock:
         audio = audio_files.get(audio_id)
+        if audio is None:
+            # A retained edit owns its raw source even after the source's older
+            # registry entry is evicted. Restore/edit must stay available.
+            audio = next((entry.original for entry in audio_files.values()
+                          if entry.original_id == audio_id and entry.original is not None), None)
     if audio is None and re.fullmatch(r"g-[a-f0-9]{32}", audio_id):
         candidate = voice.OUTPUT_DIR / f"speech-{audio_id[2:]}.wav"
         if candidate.resolve().is_relative_to(voice.OUTPUT_DIR.resolve()) and candidate.is_file():
@@ -154,7 +218,7 @@ async def request_size_limit(request: Request, call_next):
 def config():
     example = None
     if voice.EXAMPLE_AUDIO.is_file():
-        example = {"id": "example", "url": "/api/audio/example", "transcript": voice.EXAMPLE_TRANSCRIPT, "status": "Example voice ready."}
+        example = {"id": "example", "url": "/api/audio/example", "transcript": voice.EXAMPLE_TRANSCRIPT, "status": "Example voice ready.", "duration_seconds": sf.info(voice.EXAMPLE_AUDIO).duration}
     return {
         "device": voice.DEVICE,
         "resumable_generation": True,
@@ -185,7 +249,7 @@ def audio(audio_id: str):
 
 
 @api.post("/api/reference")
-async def reference(file: UploadFile = File(...)):
+async def reference(file: UploadFile = File(...), noise_reduction: bool = Form(True)):
     """Normalize a bounded upload, validate it, then attempt transcription."""
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     upload_path = UPLOAD_DIR / f"upload-{uuid4().hex}"
@@ -200,20 +264,30 @@ async def reference(file: UploadFile = File(...)):
                 target.write(chunk)
         samples, sample_rate = await run_in_threadpool(_validate_reference, upload_path)
         await run_in_threadpool(sf.write, normalized_path, samples, sample_rate, subtype="PCM_16")
-        try:
-            transcript = (await run_in_threadpool(voice.stt.transcribe_file, str(normalized_path), max_seconds=voice.REFERENCE_LIMIT)).strip()
-            status = "Recording transcribed. Check the words before generating speech." if transcript else "No speech was recognized. Enter the exact words in the recording."
-        except Exception as exc:
-            LOGGER.warning("Reference transcription failed: %s", exc)
-            transcript = ""
-            status = f"Automatic transcription is unavailable: {exc}. Enter the exact words in the recording."
-        return _register(normalized_path, transcript, status)
+        if noise_reduction:
+            return await run_in_threadpool(_processed_reference, normalized_path)
+        transcript, status = await run_in_threadpool(_transcribe_reference, normalized_path)
+        result = _register(normalized_path, transcript, status)
+        result["noise_reduction"] = False
+        return result
     except BaseException:
         normalized_path.unlink(missing_ok=True)
         raise
     finally:
         upload_path.unlink(missing_ok=True)
         await file.close()
+
+
+@api.post("/api/reference/process")
+async def edit_reference(payload: ProcessReferenceRequest):
+    selected = _lookup(payload.reference_id)
+    original_id = selected.original_id or payload.reference_id
+    original = _lookup(original_id)
+    return await run_in_threadpool(
+        _processed_reference, original.path, original_id=original_id,
+        start_seconds=payload.start_seconds, end_seconds=payload.end_seconds,
+        noise_reduction=payload.noise_reduction, auto_trim=payload.auto_trim,
+    )
 
 
 async def _recording_action(action, payload):
@@ -286,13 +360,13 @@ async def recording_finish(payload: RecordingPCM):
         with anyio.CancelScope(shield=True):
             cached = finished_references.get(payload.token)
             if cached is not None:
-                _, original_digest, published, path = cached
+                _, original_digest, published, saved = cached
                 if original_digest != digest:
                     raise HTTPException(400, "The completed recording cannot be changed on retry.")
-                if not Path(path).is_file():
+                if not saved.path.is_file():
                     raise HTTPException(410, "The saved recording is unavailable. Upload your local copy.")
                 with audio_lock:
-                    audio_files[published["id"]] = AudioFile(Path(path), published["transcript"], published["status"])
+                    audio_files[published["id"]] = saved
                     while len(audio_files) > MAX_AUDIO_ENTRIES:
                         audio_files.popitem(last=False)
                 return published
@@ -309,8 +383,14 @@ async def recording_finish(payload: RecordingPCM):
                 await _recording_action(recorder.cancel, RecordingToken(token=payload.token))
                 Path(path).unlink(missing_ok=True)
                 raise
-            published = _register(path, transcript, status)
-            finished_references[payload.token] = (time.monotonic(), digest, published, path)
+            if recorder.cleanup_enabled(payload.token):
+                published = await run_in_threadpool(_processed_reference, path,
+                                                    original_transcript=transcript, original_status=status)
+            else:
+                published = _register(path, transcript, status)
+                published["noise_reduction"] = False
+            saved = _lookup(published["id"])
+            finished_references[payload.token] = (time.monotonic(), digest, published, saved)
             _prune_finished_references()
             return published
 

@@ -23,6 +23,16 @@ def build_app():
                     gr.Markdown(f"Record a clear 3–{min(10, voice.REFERENCE_LIMIT)} second English sentence. Your words appear while you speak and fill the transcript when you finish. You can also upload a recording. Review the transcript before generating speech.")
                     microphone = build_recorder(voice.REFERENCE_LIMIT)
                     reference = gr.Audio(label="Reference voice · upload or preview", value=str(voice.EXAMPLE_AUDIO) if voice.EXAMPLE_AUDIO.exists() else None, sources=["upload"], type="filepath", editable=False)
+                    with gr.Accordion("Clean up and crop the reference", open=False):
+                        gr.Markdown("Reduce steady background hiss and rumble, then listen to the result. Crop times refer to the original recording; each edit starts from that original. Keep at least one second of speech. Noise reduction does not isolate overlapping speakers or music.")
+                        with gr.Row():
+                            crop_start = gr.Number(label="Crop start · seconds in original", value=0, minimum=0)
+                            crop_end = gr.Number(label="Crop end · seconds in original", value=None, minimum=0)
+                        noise_reduction = gr.Checkbox(label="Reduce background noise", value=True)
+                        auto_trim = gr.Checkbox(label="Trim quiet beginning and end automatically", value=False)
+                        with gr.Row():
+                            apply_edits = gr.Button("Apply cleanup and crop")
+                            restore_original = gr.Button("Restore original recording")
                     transcript = gr.Textbox(label="Words in the recording · filled automatically, editable", value=voice.EXAMPLE_TRANSCRIPT if voice.EXAMPLE_AUDIO.exists() else "", lines=2)
                     asr_status = gr.Textbox(label="Transcription", value="Example voice ready. Record or upload your own voice for automatic transcription.", interactive=False)
                     example = gr.Button("Use example voice")
@@ -43,6 +53,15 @@ def build_app():
         )
         reference.clear(voice.clear_reference, [reference_state], [transcript, asr_status, generate, microphone], queue=False)
         example.click(voice.restore_example, [reference_state], [reference, transcript, asr_status, generate, microphone], queue=False)
+        edit_outputs = [reference, transcript, asr_status, generate, microphone]
+        apply_edits.click(
+            voice.edit_reference, [crop_start, crop_end, noise_reduction, auto_trim, reference_state], edit_outputs,
+            concurrency_limit=1, concurrency_id="reference-transcription", show_progress="hidden",
+        )
+        restore_original.click(
+            voice.restore_original_reference, [reference_state], edit_outputs,
+            concurrency_limit=1, concurrency_id="reference-transcription", show_progress="hidden",
+        )
         generate.click(voice.synthesize_ready, [text, reference, transcript, steps, seed, reference_state], [output, status, generate, stop], api_name="synthesize", concurrency_limit=1, show_progress="hidden")
         stop.click(voice.stop_generation, queue=False, api_name="stop")
     return demo.queue(default_concurrency_limit=1, max_size=4)

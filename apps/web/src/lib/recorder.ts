@@ -119,7 +119,7 @@ export class VoiceRecorder {
   private text = ""
   private resolveStopped?: () => void
 
-  constructor(private callbacks: Callbacks) {}
+  constructor(private callbacks: Callbacks, private noiseReduction = true) {}
 
   private async send<T>(url: string, data: unknown, timeout: number, controller = new AbortController()): Promise<T> {
     this.controllers.add(controller)
@@ -137,14 +137,14 @@ export class VoiceRecorder {
     try {
       if (!navigator.mediaDevices?.getUserMedia) throw new Error("Microphone access needs localhost or HTTPS.")
       this.callbacks.onStatus("Allow microphone access to start recording…")
-      this.stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false } })
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: this.noiseReduction, noiseSuppression: this.noiseReduction, autoGainControl: false } })
       if (this.cancelled) { await this.release(); return }
       this.context = new AudioContext({ sampleRate: 16000 })
       await this.context.resume()
       const url = URL.createObjectURL(new Blob([captureProcessorSource()], { type: "application/javascript" }))
       try { await this.context.audioWorklet.addModule(url) } finally { URL.revokeObjectURL(url) }
       if (this.cancelled) { await this.release(); return }
-      const started = await this.send<{ token: string; max_seconds: number }>("/api/recordings/start", { sample_rate: this.context.sampleRate }, 15_000)
+      const started = await this.send<{ token: string; max_seconds: number }>("/api/recordings/start", { sample_rate: this.context.sampleRate, noise_reduction: this.noiseReduction }, 15_000)
       if (typeof started.token !== "string" || started.token.length < 20 || started.token.length > 100) throw new Error("The server did not confirm a recording session.")
       this.token = started.token
       if (this.cancelled) { await this.cancel(); return }

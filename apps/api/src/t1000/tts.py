@@ -23,6 +23,7 @@ from .inference_settings import get_inference_settings
 from .eager import configure_eager_cache, read_eager_cache_enabled
 from .compiled_vocoder import configure_compiled_vocoder, read_compiled_vocoder_enabled
 from .references import configure_prompt_audio
+from .reference_processing import process_reference
 from .mic import consume_complete
 from .paragraphs import REQUEST_TEXT_LIMIT, plan_text
 from .paths import ASSETS, CACHE, MODELS, OUTPUT
@@ -125,6 +126,7 @@ class ReferenceState:
 
     def __init__(self):
         self.path = str(EXAMPLE_AUDIO) if EXAMPLE_AUDIO.exists() else None
+        self.original_path = self.path
         self.ready = EXAMPLE_AUDIO.exists()
         self.version = 0
         self.recording_token = None
@@ -133,9 +135,10 @@ class ReferenceState:
     def __deepcopy__(self, memo):
         return ReferenceState()
 
-    def replace(self, path=None, ready=False, recording_token=None):
+    def replace(self, path=None, ready=False, recording_token=None, original_path=None):
         self.version += 1
         self.path = path
+        self.original_path = path if original_path is None else original_path
         self.ready = ready
         self.recording_token = recording_token
 
@@ -214,6 +217,82 @@ def restore_example(state):
     with state.lock:
         state.replace(path=str(EXAMPLE_AUDIO), ready=True)
     return str(EXAMPLE_AUDIO), EXAMPLE_TRANSCRIPT, "Example voice ready.", gr.update(interactive=True), uuid4().hex
+
+
+def _edit_reference(state, *, restore=False, start_seconds=0, end_seconds=None,
+                    noise_reduction=True, auto_trim=False):
+    """Publish edits only if their original reference is still selected."""
+    with state.lock:
+        if not state.ready or not state.path or not state.original_path:
+            raise gr.Error("Finish recording and wait for its transcript before editing the reference.")
+        prior_path, original_path = state.path, state.original_path
+        state.version += 1
+        version = state.version
+        state.ready = False
+    edited_path = None
+    try:
+        yield gr.skip(), gr.skip(), "Restoring the original…" if restore else "Cleaning and cropping the reference…", gr.update(interactive=False), gr.skip()
+        samples, sample_rate = read_reference(original_path)
+        if restore:
+            selected_path = original_path
+        else:
+            cleaned = process_reference(
+                samples, sample_rate, start_seconds=start_seconds, end_seconds=end_seconds,
+                noise_reduction=noise_reduction, auto_trim=auto_trim,
+            )
+            directory = CACHE / "reference-edits"
+            directory.mkdir(parents=True, exist_ok=True)
+            edited_path = directory / f"reference-{uuid4().hex}.wav"
+            sf.write(edited_path, cleaned, sample_rate, subtype="PCM_16")
+            read_reference(str(edited_path))
+            selected_path = str(edited_path)
+        try:
+            words = stt.transcribe_file(selected_path, max_seconds=REFERENCE_LIMIT).strip()
+            message = (
+                "Original restored. " if restore else "Reference edits applied. "
+            ) + (
+                "Check the updated words before generating speech." if words
+                else "No speech was recognized. Enter the exact words in the selected audio."
+            )
+        except Exception as exc:
+            LOGGER.warning("Edited reference transcription failed: %s", exc)
+            words = ""
+            message = f"{'Original restored' if restore else 'Reference edits applied'}. Automatic transcription is unavailable: {exc}. Enter the exact words in the selected audio."
+    except BaseException as exc:
+        if edited_path is not None:
+            edited_path.unlink(missing_ok=True)
+        with state.lock:
+            current = version == state.version and state.path == prior_path
+            if current:
+                state.ready = True
+        if not isinstance(exc, Exception):
+            raise
+        if current:
+            yield gr.skip(), gr.skip(), f"Reference edit failed: {exc}", gr.update(interactive=True), gr.skip()
+        else:
+            yield (gr.skip(),) * 5
+        return
+    with state.lock:
+        current = version == state.version and state.path == prior_path
+        if current:
+            state.replace(path=selected_path, ready=True, original_path=original_path)
+    if not current:
+        if edited_path is not None:
+            edited_path.unlink(missing_ok=True)
+        yield (gr.skip(),) * 5
+        return
+    yield selected_path, words, message, gr.update(interactive=True), uuid4().hex
+
+
+def edit_reference(start_seconds, end_seconds, noise_reduction, auto_trim, state):
+    yield from _edit_reference(
+        state, start_seconds=start_seconds, end_seconds=end_seconds,
+        noise_reduction=noise_reduction, auto_trim=auto_trim,
+    )
+
+
+def restore_original_reference(state):
+    yield from _edit_reference(state, restore=True)
 
 
 def synthesize_ready(text, reference_audio, transcript, steps, seed, state):

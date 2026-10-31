@@ -4,3 +4,4 @@
 dots.tts @ git+https://github.com/studio-dots-ai/dots.tts.git@b65ca7149fb43b8fb8d52916aa12738deda7b188
 sherpa-onnx==2.0.1
 soxr==1.1.0
+scipy>=1.12,<2

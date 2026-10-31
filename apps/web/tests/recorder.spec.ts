@@ -24,7 +24,7 @@ async function recorder(page: Page, options: Record<string, unknown> = {}) {
       signal?.addEventListener("abort", () => { state.feedAborted++; reject(new DOMException("Aborted", "AbortError")) }, { once: true })
     })
     const post = async (url: string, data: any, signal?: AbortSignal) => {
-      if (url.endsWith("/start")) return { token: "test-recording-token-0123456789", max_seconds: options.maximum ? Number(options.maximum) / 16000 : 6 }
+      if (url.endsWith("/start")) { state.startRequest = data; return { token: "test-recording-token-0123456789", max_seconds: options.maximum ? Number(options.maximum) / 16000 : 6 } }
       if (url.endsWith("/cancel")) { state.cancelled++; return { cancelled: true } }
       if (url.endsWith("/feed")) {
         state.feedRequests.push({ ...data })
@@ -78,7 +78,7 @@ async function recorder(page: Page, options: Record<string, unknown> = {}) {
       connect() {}
       disconnect() {}
     }
-    Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: { getUserMedia: async () => ({ getTracks: () => [{ stop() { state.micStopped++ } }] }) } })
+    Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: { getUserMedia: async (constraints: unknown) => { state.constraints = constraints; return { getTracks: () => [{ stop() { state.micStopped++ } }] } } } })
     Object.defineProperty(window, "AudioContext", { configurable: true, value: Context })
     Object.defineProperty(window, "AudioWorkletNode", { configurable: true, value: Node })
     const exports: any = {}
@@ -90,7 +90,7 @@ async function recorder(page: Page, options: Record<string, unknown> = {}) {
       onComplete: (value: any) => state.completed.push(value),
       onRecovery: (file: File, message: string) => { state.recovered = file; state.recoveryMessage = message },
       onError: (message: string) => state.errors.push(message),
-    })
+    }, options.noiseReduction === undefined ? true : options.noiseReduction)
     await state.recorder.start()
     clearInterval(state.recorder.timer)
     state.push = async (length: number) => {
@@ -104,6 +104,19 @@ async function recorder(page: Page, options: Record<string, unknown> = {}) {
     }
     state.finalSamples = () => decode(state.finishRequests.at(-1).pcm)
   }, { code: compiled, options })
+}
+
+for (const noiseReduction of [true, false]) {
+  test(`capture and server noise reduction follow the selected option (${noiseReduction})`, async ({ page }) => {
+    await recorder(page, { noiseReduction })
+    const settings = await page.evaluate(() => {
+      const s = (window as any).captureTest
+      return { constraints: s.constraints, start: s.startRequest }
+    })
+    expect(settings.constraints).toEqual({ audio: { channelCount: 1, echoCancellation: noiseReduction, noiseSuppression: noiseReduction, autoGainControl: false } })
+    expect(settings.start).toEqual({ sample_rate: 16000, noise_reduction: noiseReduction })
+    await page.evaluate(async () => { await (window as any).captureTest.recorder.cancel() })
+  })
 }
 
 async function state(page: Page) {

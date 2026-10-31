@@ -47,7 +47,7 @@ class RecordingFinishConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             return {"token": self.token}
 
         consume = Mock(side_effect=self.consume)
-        recorder = SimpleNamespace(finish=finish, consume=consume)
+        recorder = SimpleNamespace(finish=finish, consume=consume, cleanup_enabled=lambda _token: False)
         with patch.object(api, "recorder", recorder):
             first = asyncio.create_task(api.recording_finish(self.payload))
             await asyncio.wait_for(started.wait(), 1)
@@ -95,7 +95,7 @@ class RecordingFinishConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         # The fake keeps a recoverable result to isolate the API lease handoff;
         # the real recorder can instead report that this token was cancelled.
         consume = Mock(side_effect=self.consume)
-        recorder = SimpleNamespace(finish=finish, cancel=cancel, consume=consume)
+        recorder = SimpleNamespace(finish=finish, cancel=cancel, consume=consume, cleanup_enabled=lambda _token: False)
         with patch.object(api, "recorder", recorder):
             cancelling = asyncio.create_task(api.recording_cancel(api.RecordingToken(token=self.token)))
             await asyncio.wait_for(cancel_started.wait(), 1)

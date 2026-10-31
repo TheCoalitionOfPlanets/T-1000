@@ -112,7 +112,7 @@ async function start() {
     show('Requesting microphone access…');
     try {
         if (!navigator.mediaDevices?.getUserMedia) throw new Error('Microphone access needs localhost or HTTPS.');
-        state.stream = await navigator.mediaDevices.getUserMedia({audio: {channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false}});
+        state.stream = await navigator.mediaDevices.getUserMedia({audio: {channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: false}});
         if (id !== generation) { await release(state); return; }
         state.context = new AudioContext({sampleRate: 16000});
         await state.context.resume();
