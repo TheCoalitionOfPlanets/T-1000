@@ -135,6 +135,11 @@ For a CUDA installation, use the GPU dependency commands in the [setup guide](do
 
 The first generation also loads the speech model. CPU synthesis can take several minutes; start with one short sentence.
 
+On the configured RTX 3050 server, use `./scripts/start.sh` to start the
+installed native studio in the background. It stops T-2000 before starting
+T-1000 so the two studios share the GPU safely. See [server startup](docs/server.md)
+for prerequisites, SSH access, and service management commands.
+
 ## Usage
 
 To use your own voice, click **Record voice**, speak a clear 3–6 second sentence, and click **Finish recording**. You can also choose **Upload audio**. Review the editable **Reference transcript** so its words match the recording exactly, then generate your new text. **Use example voice** restores the bundled reference and matching transcript.
@@ -364,6 +369,7 @@ Try the bundled voice and one short English sentence. Check that your own refere
 | :--- | :--- |
 | [Setup](docs/setup.md) | GPU installation, pinned downloads, verification, and troubleshooting. |
 | [Docker](docs/docker.md) | Separate CPU/GPU builds, automatic model setup, persistent volumes, and container benchmarks. |
+| [Server startup](docs/server.md) | Start and manage the installed RTX 3050 studio and switch the shared GPU between T-1000 and T-2000. |
 | [Changelog](CHANGELOG.md) | Implementation changes and validation records. |
 | [Reference audio](assets/README.md) | Bundled clip provenance and its exact transcript. |
 | [Third-party notices](apps/web/NOTICE.md) | UI component and font sources and licenses. |
